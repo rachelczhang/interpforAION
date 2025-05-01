@@ -1,0 +1,6 @@
+[submodule "4Mclone"]
+	path = 4Mclone
+	url = git@github.com:PolymathicAI/4Mclone.git
+[submodule "AION"]
+	path = AION
+	url = git@github.com:PolymathicAI/AION.git
