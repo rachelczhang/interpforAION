@@ -7,7 +7,7 @@ import wandb
 def train_sae(activations_tensor_flat, autoencoder, device):
     # Create dataset and dataloader
     dataset = TensorDataset(activations_tensor_flat)
-    dataloader = DataLoader(dataset, batch_size=32, shuffle=True)
+    dataloader = DataLoader(dataset, batch_size=256, shuffle=True)
 
     # Loss function and optimizer
     criterion = nn.MSELoss()
@@ -20,6 +20,8 @@ def train_sae(activations_tensor_flat, autoencoder, device):
     num_epochs = 10000
     for epoch in range(num_epochs):
         total_loss = 0
+        total_reconstruction_loss = 0
+        total_sparsity_loss = 0
         for batch in dataloader:
             batch = batch[0].to(device)
 
@@ -40,10 +42,14 @@ def train_sae(activations_tensor_flat, autoencoder, device):
             autoencoder.normalize_decoder_weights()
 
             total_loss += loss.item()
+            total_reconstruction_loss += reconstruction_loss.item()
+            total_sparsity_loss += sparsity_loss.item()
 
         avg_loss = total_loss / len(dataloader)
-        print(f'Epoch [{epoch+1}/{num_epochs}], Loss: {avg_loss:.6f}, Reconstruction Loss: {reconstruction_loss.item():.6f}, Sparsity Loss: {sparsity_loss.item():.6f}', flush=True)
-        wandb.log({"epoch": epoch+1, "loss": avg_loss, "reconstruction_loss": reconstruction_loss.item(), "sparsity_loss": sparsity_loss.item()})
+        avg_reconstruction_loss = total_reconstruction_loss / len(dataloader)
+        avg_sparsity_loss = total_sparsity_loss / len(dataloader)
+        print(f'Epoch [{epoch+1}/{num_epochs}], Loss: {avg_loss:.6f}, Reconstruction Loss: {avg_reconstruction_loss:.6f}, Sparsity Loss: {avg_sparsity_loss:.6f}', flush=True)
+        wandb.log({"epoch": epoch+1, "loss": avg_loss, "reconstruction_loss": avg_reconstruction_loss, "sparsity_loss": avg_sparsity_loss})
 
         if avg_loss < best_loss:
             best_loss = avg_loss
