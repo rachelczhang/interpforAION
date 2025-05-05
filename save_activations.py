@@ -16,20 +16,8 @@ sys.path.append(os.path.join(current_dir, "AION"))
 sys.path.append(os.path.join(current_dir, "4Mclone"))
 
 from aion import AION
-from run_training_4m_fsdp_single_epoch import get_args, setup_data
+from run_training_4m_fsdp_single_epoch import setup_data
 
-# Load model with trained parameters
-print("\n=== Loading Model ===")
-model = AION.from_pretrained('/mnt/ceph/users/polymathic/aion/dec24/base')
-print(f"Model loaded from pretrained weights")
-model.freeze_encoder()
-model.freeze_decoder()
-model = model.cuda().eval()  
-print(f"Model moved to CUDA and set to eval mode")
-print(f"Model architecture:\n{model}")
-
-# Load tokenized training data
-print("\n=== Setting Up Data ===")
 class Args:
     """Simple class to hold arguments needed for setup functions."""
     def __init__(self):
@@ -54,64 +42,59 @@ class Args:
         self.out_domains = None
         self.all_domains = None
 
-args = Args()
-print(f"Data config path: {args.data_config}")
-print(f"Text tokenizer path: {args.text_tokenizer_path}")
-print(f"Batch size: {args.batch_size}")
-print(f"Epoch size: {args.epoch_size}")
+def get_data(args):
+    # Load data config
+    with open(args.data_config, "r") as f:
+        data_config = yaml.safe_load(f)
 
-# Load data config
-with open(args.data_config, "r") as f:
-    data_config = yaml.safe_load(f)
+    modality_info, data_loader_train, num_train_steps, data_loaders_val, _ = setup_data(args)
 
-modality_info, data_loader_train, num_train_steps, data_loaders_val, _ = setup_data(args)
-
-# Print detailed modality information
-print("\n=== Modality Information ===")
-print(f"Available modalities: {list(modality_info.keys())}")
-for mod_name, mod_info in modality_info.items():
-    print(f"\nModality: {mod_name}")
-    # Print all available keys in the modality info
-    print("  Available keys:", list(mod_info.keys()))
-    # Print specific information if available
-    if 'input_size' in mod_info:
-        print(f"  Input size: {mod_info['input_size']}")
-    if 'patch_size' in mod_info:
-        print(f"  Patch size: {mod_info['patch_size']}")
-    if 'num_input_tokens' in mod_info:
-        print(f"  Num input tokens: {mod_info['num_input_tokens']}")
-    if 'num_target_tokens' in mod_info:
-        print(f"  Num target tokens: {mod_info['num_target_tokens']}")
-    # Print any other relevant information
-    for key, value in mod_info.items():
-        if key not in ['input_size', 'patch_size', 'num_input_tokens', 'num_target_tokens']:
-            print(f"  {key}: {value}")
-
-# Print data loader information
-print("\n=== Data Loader Information ===")
-print(f"Number of training steps per epoch: {num_train_steps}")
-
-# Check the structure of a batch
-print("\n=== Sample Batch Structure ===")
-sample_batch = next(iter(data_loader_train))
-if isinstance(sample_batch, dict):
-    print(f"Batch keys: {list(sample_batch.keys())}")
-    for mod_name, mod_data in sample_batch.items():
+    # Print detailed modality information
+    print("\n=== Modality Information ===")
+    print(f"Available modalities: {list(modality_info.keys())}")
+    for mod_name, mod_info in modality_info.items():
         print(f"\nModality: {mod_name}")
-        for key, value in mod_data.items():
-            if isinstance(value, torch.Tensor):
-                print(f"  {key} shape: {value.shape}")
-                print(f"  {key} dtype: {value.dtype}")
-                print(f"  {key} device: {value.device}")
-                if key == 'tensor':
-                    if value.numel() > 0:  # Check if tensor is not empty
-                        print(f"  {key} min value: {value.min().item()}")
-                        print(f"  {key} max value: {value.max().item()}")
-                        print(f"  {key} mean value: {value.float().mean().item()}")
-                    else:
-                        print(f"  {key} is empty - skipping min/max/mean calculations")
+        # Print all available keys in the modality info
+        print("  Available keys:", list(mod_info.keys()))
+        # Print specific information if available
+        if 'input_size' in mod_info:
+            print(f"  Input size: {mod_info['input_size']}")
+        if 'patch_size' in mod_info:
+            print(f"  Patch size: {mod_info['patch_size']}")
+        if 'num_input_tokens' in mod_info:
+            print(f"  Num input tokens: {mod_info['num_input_tokens']}")
+        if 'num_target_tokens' in mod_info:
+            print(f"  Num target tokens: {mod_info['num_target_tokens']}")
+        # Print any other relevant information
+        for key, value in mod_info.items():
+            if key not in ['input_size', 'patch_size', 'num_input_tokens', 'num_target_tokens']:
+                print(f"  {key}: {value}")
 
-# Collect activations from a layer in AION
+    # Print data loader information
+    print("\n=== Data Loader Information ===")
+    print(f"Number of training steps per epoch: {num_train_steps}")
+
+    # Check the structure of a batch
+    print("\n=== Sample Batch Structure ===")
+    sample_batch = next(iter(data_loader_train))
+    if isinstance(sample_batch, dict):
+        print(f"Batch keys: {list(sample_batch.keys())}")
+        for mod_name, mod_data in sample_batch.items():
+            print(f"\nModality: {mod_name}")
+            for key, value in mod_data.items():
+                if isinstance(value, torch.Tensor):
+                    print(f"  {key} shape: {value.shape}")
+                    print(f"  {key} dtype: {value.dtype}")
+                    print(f"  {key} device: {value.device}")
+                    if key == 'tensor':
+                        if value.numel() > 0:  # Check if tensor is not empty
+                            print(f"  {key} min value: {value.min().item()}")
+                            print(f"  {key} max value: {value.max().item()}")
+                            print(f"  {key} mean value: {value.float().mean().item()}")
+                        else:
+                            print(f"  {key} is empty - skipping min/max/mean calculations")
+    return data_loader_train
+
 def collect_activations_batched(model, data_loader, device):
     print("\n=== Starting Activation Collection ===")
     activations = []
@@ -228,14 +211,33 @@ def collect_activations_batched(model, data_loader, device):
     
     return activations_tensor_flat, examples_processed
 
-# Collect activations from a subset of the data
-print("\n=== Starting Main Collection Process ===")
-print(f"Will collect activations from all available examples in the data loader")
-activations, total_examples = collect_activations_batched(model, data_loader_train, device='cuda')
+if __name__ == '__main__':
+    # Load model with trained parameters
+    print("\n=== Loading Model ===")
+    model = AION.from_pretrained('/mnt/ceph/users/polymathic/aion/dec24/base')
+    print(f"Model loaded from pretrained weights")
+    model.freeze_encoder()
+    model.freeze_decoder()
+    model = model.cuda().eval()  
+    print(f"Model moved to CUDA and set to eval mode")
+    print(f"Model architecture:\n{model}")
 
-# Save activations to file
-print("\n=== Saving Activations ===")
-output_file = f'/mnt/home/rzhang/ceph/activations_{total_examples}examples.pt'
-torch.save(activations, output_file)
-print(f"Saved {total_examples} examples of activations to {output_file}")
-print(f"File size: {os.path.getsize(output_file) / (1024*1024):.2f} MB")
+    args = Args()
+    print(f"Data config path: {args.data_config}")
+    print(f"Text tokenizer path: {args.text_tokenizer_path}")
+    print(f"Batch size: {args.batch_size}")
+    print(f"Epoch size: {args.epoch_size}")
+
+    data_loader_train = get_data(args)
+
+    # Collect activations from a subset of the data
+    print("\n=== Starting Main Collection Process ===")
+    print(f"Will collect activations from all available examples in the data loader")
+    activations, total_examples = collect_activations_batched(model, data_loader_train, device='cuda')
+
+    # Save activations to file
+    print("\n=== Saving Activations ===")
+    output_file = f'/mnt/home/rzhang/ceph/activations_{total_examples}examples.pt'
+    torch.save(activations, output_file)
+    print(f"Saved {total_examples} examples of activations to {output_file}")
+    print(f"File size: {os.path.getsize(output_file) / (1024*1024):.2f} MB")
