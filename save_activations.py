@@ -98,7 +98,7 @@ def get_data(args):
 def collect_activations_batched(model, data_loader, device):
     print("\n=== Starting Activation Collection ===")
     activations = []
-    modality_counts = defaultdict(int)
+    # modality_samples = {} 
     examples_processed = 0
     
     def hook_fn(module, input, output):
@@ -110,6 +110,42 @@ def collect_activations_batched(model, data_loader, device):
     hook = ninth_decoder_block.register_forward_hook(hook_fn)
     print(f"Registered hook on decoder block 8")
 
+    # # Process a single batch first for detailed analysis
+    # first_batch = next(iter(data_loader))
+    # print("\n=== DETAILED TENSOR ANALYSIS OF FIRST BATCH ===")
+    
+    # # Examine each modality's tensor in detail
+    # for mod, d in first_batch.items():
+    #     tensor = d.get('tensor', None)
+    #     if tensor is not None:
+    #         # Check if tensor contains meaningful data
+    #         if tensor.numel() > 0:
+    #             is_all_zeros = (tensor == 0).all().item()
+    #             is_all_same = (tensor == tensor[0]).all().item()
+    #             has_nan = torch.isnan(tensor).any().item()
+                
+    #             # Stats about tensor
+    #             print(f"\nModality: {mod}")
+    #             print(f"  Shape: {tensor.shape}")
+    #             print(f"  All zeros? {is_all_zeros}")
+    #             print(f"  All same value? {is_all_same}")
+    #             print(f"  Has NaN? {has_nan}")
+                
+    #             # If not all zeros/same, examine a bit more
+    #             if not is_all_zeros and not is_all_same and not has_nan:
+    #                 print(f"  Min: {tensor.min().item()}")
+    #                 print(f"  Max: {tensor.max().item()}")
+    #                 print(f"  Mean: {tensor.float().mean().item()}")
+    #                 print(f"  Std: {tensor.float().std().item()}")
+                    
+    #                 # Count non-zero samples
+    #                 non_zero_count = (tensor.abs().sum(dim=tuple(range(1, tensor.dim()))) > 0).sum().item()
+    #                 print(f"  Non-zero samples: {non_zero_count} / {tensor.shape[0]}")
+                    
+    #                 # This is a modality with real data
+    #                 if non_zero_count > 0:
+    #                     modality_samples[mod] = tensor[0].clone().detach().cpu()  # Save first sample
+    
     with torch.no_grad():
         for batch_idx, data in enumerate(data_loader):
             print(f"\nProcessing batch {batch_idx + 1}")
@@ -124,24 +160,6 @@ def collect_activations_batched(model, data_loader, device):
             for mod, d in data.items():
                 processed_data[mod] = {k: v.to(device) if isinstance(v, torch.Tensor) else v 
                                       for k, v in d.items()}
-                
-                # Improved modality counting - check for valid/non-empty data
-                if 'tensor' in d:
-                    # If has target_mask, count only valid entries
-                    if 'target_mask' in d and d['target_mask'] is not None:
-                        # Count samples with at least one valid entry in mask
-                        valid_samples = (d['target_mask'].sum(dim=1) > 0).sum().item()
-                        modality_counts[mod] += valid_samples
-                    # If doesn't have target_mask but has mask
-                    elif 'mask' in d and d['mask'] is not None:
-                        valid_samples = (d['mask'].sum(dim=1) > 0).sum().item()
-                        modality_counts[mod] += valid_samples
-                    # If no mask available, check for non-zero values
-                    elif d['tensor'].numel() > 0:
-                        # Count non-zero samples (at least some valid content)
-                        non_zero_samples = ((d['tensor'].abs().sum(dim=tuple(range(1, d['tensor'].dim()))) > 0).float().sum()).item()
-                        if non_zero_samples > 0:
-                            modality_counts[mod] += non_zero_samples
             
             print("Data moved to device")
             
@@ -152,29 +170,14 @@ def collect_activations_batched(model, data_loader, device):
             for mod, d in processed_data.items():
                 if mod in model.encoder_embeddings:
                     input_dict[mod] = d['tensor']
-                    print(f"Added {mod} to input_dict with shape {d['tensor'].shape}")
+
                 if mod in model.decoder_embeddings:
                     target_mask[mod] = d['target_mask']
-                    print(f"Added {mod} to target_mask with shape {d['target_mask'].shape}")
-            
+
             # Run the batch through the model
             print("\nRunning forward pass...")
             output = model(input_dict, target_mask)
-            if isinstance(output, dict):
-                print("\nModel output dictionary contents:")
-                for mod_name, mod_output in output.items():
-                    print(f"\nModality: {mod_name}")
-                    print(f"  Output type: {type(mod_output)}")
-                    if isinstance(mod_output, torch.Tensor):
-                        print(f"  Shape: {mod_output.shape}")
-                        print(f"  Dtype: {mod_output.dtype}")
-                        print(f"  Device: {mod_output.device}")
-                        if mod_output.numel() > 0:  # Check if tensor is not empty
-                            print(f"  Min value: {mod_output.min().item()}")
-                            print(f"  Max value: {mod_output.max().item()}")
-                            print(f"  Mean value: {mod_output.float().mean().item()}")
-                        else:
-                            print(f"  Empty tensor - skipping min/max/mean calculations")
+
             torch.cuda.empty_cache()
 
             examples_processed += current_batch_size
@@ -183,13 +186,6 @@ def collect_activations_batched(model, data_loader, device):
     # Remove the hook
     hook.remove()
     print("\nHook removed")
-    
-    # Print modality counts for debugging
-    print("\n=== Modality Sample Counts ===")
-    for mod_name, count in sorted(modality_counts.items()):
-        print(f"  {mod_name}: {count} samples")
-    print(f"Total examples processed: {examples_processed}")
-    print(f"Sum of all modality counts: {sum(modality_counts.values())}")
     
     # Concatenate all activations
     print("\nConcatenating activations...")
@@ -212,14 +208,14 @@ def collect_activations_batched(model, data_loader, device):
     return activations_tensor_flat, examples_processed
 
 if __name__ == '__main__':
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     # Load model with trained parameters
     print("\n=== Loading Model ===")
     model = AION.from_pretrained('/mnt/ceph/users/polymathic/aion/dec24/base')
     print(f"Model loaded from pretrained weights")
     model.freeze_encoder()
     model.freeze_decoder()
-    model = model.cuda().eval()  
-    print(f"Model moved to CUDA and set to eval mode")
+    model = model.to(device).eval()  
     print(f"Model architecture:\n{model}")
 
     args = Args()
@@ -233,7 +229,7 @@ if __name__ == '__main__':
     # Collect activations from a subset of the data
     print("\n=== Starting Main Collection Process ===")
     print(f"Will collect activations from all available examples in the data loader")
-    activations, total_examples = collect_activations_batched(model, data_loader_train, device='cuda')
+    activations, total_examples = collect_activations_batched(model, data_loader_train, device=device)
 
     # Save activations to file
     print("\n=== Saving Activations ===")
