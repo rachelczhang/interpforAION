@@ -14,7 +14,11 @@ import webdataset as wds
 import tarfile
 from tqdm import tqdm
 import yaml
-
+from sklearn.model_selection import train_test_split
+from sklearn.metrics import log_loss, balanced_accuracy_score, f1_score
+from scipy.optimize import minimize
+import pandas as pd
+from sklearn.manifold import TSNE
 # Get the current script's directory
 current_dir = os.path.dirname(os.path.abspath(__file__))
 
@@ -100,379 +104,53 @@ def count_examples_in_shard(shard_path):
     print("\nCould not find any shard files")
     return None
 
-# def select_tokens_for_modality(targets, target_mask, num_decoder_tokens):
-#     """
-#     Select tokens using the same process as the model's forward_mask_decoder.
-    
-#     Args:
-#         targets: Tensor of target tokens [batch_size, seq_length]
-#         target_mask: Boolean mask indicating which tokens should be predicted [batch_size, seq_length]
-#         num_decoder_tokens: Maximum number of tokens to select per batch
-        
-#     Returns:
-#         selected_targets: Selected target tokens, flattened across batch dimension
-#         selected_mask: Boolean mask indicating which selected tokens are valid, flattened across batch dimension
-#     """
-#     batch_size = targets.shape[0]
-    
-#     # Add small constant to mask for deterministic sorting
-#     mask_arange = torch.arange(target_mask.shape[1], device=target_mask.device).unsqueeze(0) * 1e-6
-#     ids_shuffle = torch.argsort(target_mask + mask_arange, dim=1)
-#     ids_keep = ids_shuffle[:, :num_decoder_tokens]
-    
-#     # Gather selected tokens and their masks
-#     selected_targets = torch.gather(targets, dim=1, index=ids_keep)  # [batch_size, num_decoder_tokens]
-#     selected_mask = torch.gather(target_mask, dim=1, index=ids_keep)  # [batch_size, num_decoder_tokens]
-    
-#     # Flatten across batch dimension
-#     selected_targets = selected_targets.reshape(-1)  # [batch_size * num_decoder_tokens]
-#     selected_mask = selected_mask.reshape(-1)  # [batch_size * num_decoder_tokens]
-    
-#     return selected_targets, selected_mask
-
-# def calculate_loss_ratio(model, data_loader, autoencoder, device):
-#     """
-#     Calculate the loss ratio to evaluate autoencoder performance.
-    
-#     Loss Ratio = (L_zero_ablated - L_approximation) / (L_zero_ablated - L_original)
-    
-#     For each batch:
-#     1. Get original activations from 9th decoder block
-#     2. Calculate original loss (L_original)
-#     3. Calculate loss with zero-ablated activations (L_zero_ablated)
-#     4. Calculate loss with autoencoder approximated activations (L_approximation)
-    
-#     The model uses masked multimodal modeling where:
-#     - Input tokens are selected from various modalities up to a budget (256 tokens)
-#     - Target tokens are selected from remaining tokens up to a budget (128 tokens)
-#     - The target mask indicates which tokens should be predicted
-#     - The model's forward pass returns logits for each modality, filtered to only include tokens that should be predicted
-#     """
-#     losses = {'zero_ablated': 0, 'approximation': 0, 'original': 0}
-#     num_batches = 0
-#     total_examples = 0
-
-#     # Get the 9th decoder block
-#     layer = model.decoder[8]
-    
-#     # Hook for storing original activations
-#     original_activations = {}
-#     def store_hook(module, input, output):
-#         original_activations['decoder_block_9'] = output.clone()
-#         print(f"\nOriginal activations stats:")
-#         print(f"Shape: {output.shape}")
-#         print(f"Mean: {output.mean().item():.4f}")
-#         print(f"Std: {output.std().item():.4f}")
-#         print(f"Min: {output.min().item():.4f}")
-#         print(f"Max: {output.max().item():.4f}")
-    
-#     # Hook for modifying activations
-#     def modify_hook(new_activations):
-#         def hook(module, input, output):
-#             print(f"\nModified activations stats:")
-#             print(f"Shape: {new_activations.shape}")
-#             print(f"Mean: {new_activations.mean().item():.4f}")
-#             print(f"Std: {new_activations.std().item():.4f}")
-#             print(f"Min: {new_activations.min().item():.4f}")
-#             print(f"Max: {new_activations.max().item():.4f}")
-#             return new_activations
-#         return hook
-
-#     for batch_idx, batch in enumerate(data_loader):
-#         # Get current batch size
-#         current_batch_size = next(iter(batch.values()))['tensor'].shape[0]
-#         total_examples += current_batch_size
-#         print(f"\nProcessing batch {batch_idx + 1} with {current_batch_size} examples")
-        
-#         # Move batch to device
-#         processed_data = {}
-#         for mod, d in batch.items():
-#             processed_data[mod] = {k: v.to(device) if isinstance(v, torch.Tensor) else v 
-#                                   for k, v in d.items()}
-        
-#         # Prepare input dictionary and target mask
-#         input_dict = {}
-#         target_mask = {}
-#         for mod, d in processed_data.items():
-#             if mod in model.encoder_embeddings:
-#                 input_dict[mod] = d['tensor']
-#             if mod in model.decoder_embeddings:
-#                 target_mask[mod] = d['target_mask']
-
-#         # Calculate original loss
-#         with torch.no_grad():
-#             # Store original activations
-#             store_handle = layer.register_forward_hook(store_hook)
-            
-#             # Get model outputs including decoder_mod_mask
-#             encoder_tokens, encoder_emb, encoder_mask, _ = model.embed_inputs(
-#                 input_dict, num_encoder_tokens=256
-#             )
-#             (
-#                 decoder_tokens,
-#                 decoder_emb,
-#                 decoder_mask,
-#                 target_ids,
-#                 decoder_attention_mask,
-#                 decoder_mod_mask,
-#             ) = model.embed_targets(target_mask, num_decoder_tokens=128)
-            
-#             print(f"\nInput shapes:")
-#             print(f"Encoder tokens: {encoder_tokens.shape}")
-#             print(f"Decoder tokens: {decoder_tokens.shape}")
-#             print(f"Target IDs: {target_ids.shape}")
-#             print(f"Decoder mod mask: {decoder_mod_mask.shape}")
-            
-#             # Run the encoder and decoder
-#             encoder_output = model._encode(encoder_tokens, encoder_emb, encoder_mask)
-#             decoder_output = model._decode(
-#                 encoder_output,
-#                 encoder_mask,
-#                 decoder_tokens,
-#                 decoder_emb,
-#                 decoder_attention_mask,
-#             )
-            
-#             # Get logits for each modality
-#             logits = {}
-#             for mod in target_mask.keys():
-#                 idx = model.modality_info[mod]["id"]
-#                 mod_logits = model.decoder_embeddings[mod].forward_logits(
-#                     decoder_output[decoder_mod_mask == idx]
-#                 )
-#                 logits[mod] = mod_logits
-#                 print(f"\nModality {mod} original:")
-#                 print(f"Logits shape: {mod_logits.shape}")
-#                 print(f"Logits mean: {mod_logits.mean().item():.4f}")
-#                 print(f"Logits std: {mod_logits.std().item():.4f}")
-                
-#                 # Print top predictions for first few tokens
-#                 if mod_logits.size(0) > 0:
-#                     top_preds = torch.topk(mod_logits[:5], k=3, dim=-1)
-#                     print(f"Top 3 predictions for first 5 tokens:")
-#                     print(f"Values: {top_preds.values}")
-#                     print(f"Indices: {top_preds.indices}")
-            
-#             # Calculate loss for each modality
-#             total_loss = 0
-#             num_modalities = 0
-#             for mod, mod_logits in logits.items():
-#                 # Get the target tokens and mask for this modality
-#                 targets = processed_data[mod]['tensor']
-#                 mod_target_mask = target_mask[mod]
-                
-#                 # Skip if either logits or targets are empty
-#                 if mod_logits.size(0) == 0 or targets.size(0) == 0:
-#                     continue
-                
-#                 # Debug prints to understand shapes
-#                 print(f"\nModality: {mod}")
-#                 print(f"Targets shape: {targets.shape}")
-#                 print(f"Target mask shape: {mod_target_mask.shape}")
-#                 print(f"Logits shape: {mod_logits.shape}")
-                
-#                 # Get the target tokens that correspond to the selected logits
-#                 # We use decoder_mod_mask to find which tokens were selected
-#                 idx = model.modality_info[mod]["id"]
-#                 selected_targets = target_ids[decoder_mod_mask == idx]
-                
-#                 print(f"\nModality {mod} targets:")
-#                 print(f"Selected targets shape: {selected_targets.shape}")
-#                 print(f"First 5 targets: {selected_targets[:5]}")
-                
-#                 # Calculate cross entropy loss
-#                 loss = F.cross_entropy(mod_logits, selected_targets.long(), reduction='mean')
-#                 print(f"Loss: {loss.item():.4f}")
-                
-#                 total_loss += loss
-#                 num_modalities += 1
-            
-#             if num_modalities > 0:
-#                 avg_loss = total_loss.item() / num_modalities
-#                 losses['original'] += avg_loss
-#                 print(f"\nOriginal batch loss: {avg_loss:.4f}")
-#             store_handle.remove()
-
-#         # Calculate zero-ablated loss
-#         with torch.no_grad():
-#             zero_activations = torch.zeros_like(original_activations['decoder_block_9'])
-#             zero_handle = layer.register_forward_hook(modify_hook(zero_activations))
-            
-#             # Run model with zero-ablated activations
-#             decoder_output = model._decode(
-#                 encoder_output,
-#                 encoder_mask,
-#                 decoder_tokens,
-#                 decoder_emb,
-#                 decoder_attention_mask,
-#             )
-            
-#             # Get logits for each modality
-#             logits = {}
-#             for mod in target_mask.keys():
-#                 idx = model.modality_info[mod]["id"]
-#                 mod_logits = model.decoder_embeddings[mod].forward_logits(
-#                     decoder_output[decoder_mod_mask == idx]
-#                 )
-#                 logits[mod] = mod_logits
-#                 print(f"\nModality {mod} zero-ablated:")
-#                 print(f"Logits shape: {mod_logits.shape}")
-#                 print(f"Logits mean: {mod_logits.mean().item():.4f}")
-#                 print(f"Logits std: {mod_logits.std().item():.4f}")
-                
-#                 # Print top predictions for first few tokens
-#                 if mod_logits.size(0) > 0:
-#                     top_preds = torch.topk(mod_logits[:5], k=3, dim=-1)
-#                     print(f"Top 3 predictions for first 5 tokens:")
-#                     print(f"Values: {top_preds.values}")
-#                     print(f"Indices: {top_preds.indices}")
-            
-#             # Calculate loss for each modality
-#             total_loss = 0
-#             num_modalities = 0
-#             for mod, mod_logits in logits.items():
-#                 if mod_logits.size(0) == 0:
-#                     continue
-                
-#                 idx = model.modality_info[mod]["id"]
-#                 selected_targets = target_ids[decoder_mod_mask == idx]
-                
-#                 loss = F.cross_entropy(mod_logits, selected_targets.long(), reduction='mean')
-#                 print(f"Zero-ablated modality loss: {loss.item():.4f}")
-                
-#                 total_loss += loss
-#                 num_modalities += 1
-            
-#             if num_modalities > 0:
-#                 avg_loss = total_loss.item() / num_modalities
-#                 losses['zero_ablated'] += avg_loss
-#                 print(f"\nZero-ablated batch loss: {avg_loss:.4f}")
-#             zero_handle.remove()
-
-#         # Calculate approximation loss
-#         with torch.no_grad():
-#             # Flatten activations for autoencoder
-#             flat_activations = original_activations['decoder_block_9'].reshape(-1, original_activations['decoder_block_9'].shape[-1])
-#             reconstructed, _ = autoencoder(flat_activations)
-            
-#             print(f"\nSAE reconstruction stats:")
-#             print(f"Original activations mean: {flat_activations.mean().item():.4f}")
-#             print(f"Reconstructed activations mean: {reconstructed.mean().item():.4f}")
-#             print(f"Reconstruction error: {F.mse_loss(reconstructed, flat_activations).item():.4f}")
-            
-#             # Print distribution of reconstruction errors
-#             errors = (reconstructed - flat_activations).abs()
-#             print(f"Reconstruction error stats:")
-#             print(f"Mean error: {errors.mean().item():.4f}")
-#             print(f"Std error: {errors.std().item():.4f}")
-#             print(f"Max error: {errors.max().item():.4f}")
-            
-#             # Print correlation between original and reconstructed activations
-#             orig_flat = flat_activations.reshape(-1)
-#             recon_flat = reconstructed.reshape(-1)
-#             correlation = torch.corrcoef(torch.stack([orig_flat, recon_flat]))[0,1]
-#             print(f"Correlation between original and reconstructed: {correlation.item():.4f}")
-            
-#             approximated_activations = reconstructed.reshape(original_activations['decoder_block_9'].shape)
-#             approx_handle = layer.register_forward_hook(modify_hook(approximated_activations))
-            
-#             # Run model with approximated activations
-#             decoder_output = model._decode(
-#                 encoder_output,
-#                 encoder_mask,
-#                 decoder_tokens,
-#                 decoder_emb,
-#                 decoder_attention_mask,
-#             )
-            
-#             # Get logits for each modality
-#             logits = {}
-#             for mod in target_mask.keys():
-#                 idx = model.modality_info[mod]["id"]
-#                 mod_logits = model.decoder_embeddings[mod].forward_logits(
-#                     decoder_output[decoder_mod_mask == idx]
-#                 )
-#                 logits[mod] = mod_logits
-#                 print(f"\nModality {mod} approximated:")
-#                 print(f"Logits shape: {mod_logits.shape}")
-#                 print(f"Logits mean: {mod_logits.mean().item():.4f}")
-#                 print(f"Logits std: {mod_logits.std().item():.4f}")
-                
-#                 # Print top predictions for first few tokens
-#                 if mod_logits.size(0) > 0:
-#                     top_preds = torch.topk(mod_logits[:5], k=3, dim=-1)
-#                     print(f"Top 3 predictions for first 5 tokens:")
-#                     print(f"Values: {top_preds.values}")
-#                     print(f"Indices: {top_preds.indices}")
-            
-#             # Calculate loss for each modality
-#             total_loss = 0
-#             num_modalities = 0
-#             for mod, mod_logits in logits.items():
-#                 if mod_logits.size(0) == 0:
-#                     continue
-                
-#                 idx = model.modality_info[mod]["id"]
-#                 selected_targets = target_ids[decoder_mod_mask == idx]
-                
-#                 loss = F.cross_entropy(mod_logits, selected_targets.long(), reduction='mean')
-#                 print(f"Approximated modality loss: {loss.item():.4f}")
-                
-#                 total_loss += loss
-#                 num_modalities += 1
-            
-#             if num_modalities > 0:
-#                 avg_loss = total_loss.item() / num_modalities
-#                 losses['approximation'] += avg_loss
-#                 print(f"\nApproximated batch loss: {avg_loss:.4f}")
-#             approx_handle.remove()
-        
-#         num_batches += 1
-#         print(f"\nCompleted batch {batch_idx + 1}")
-#         print(f"Running averages:")
-#         print(f"  Original loss: {losses['original'] / num_batches:.4f}")
-#         print(f"  Zero-ablated loss: {losses['zero_ablated'] / num_batches:.4f}")
-#         print(f"  Approximation loss: {losses['approximation'] / num_batches:.4f}")
-
-#     # Average losses across all batches
-#     for key in losses:
-#         losses[key] /= num_batches
-    
-#     # Calculate loss ratio
-#     mlp_contribution = losses['zero_ablated'] - losses['original']
-#     autoencoder_contribution = losses['zero_ablated'] - losses['approximation']
-#     loss_ratio = (autoencoder_contribution / mlp_contribution) * 100
-    
-#     print("\nFinal Loss Analysis:")
-#     print(f"Original Loss: {losses['original']:.4f}")
-#     print(f"Zero-ablated Loss: {losses['zero_ablated']:.4f}")
-#     print(f"Approximation Loss: {losses['approximation']:.4f}")
-#     print(f"MLP's contribution to loss reduction: {mlp_contribution:.4f}")
-#     print(f"Autoencoder's contribution to loss reduction: {autoencoder_contribution:.4f}")
-#     print(f"\nLoss Ratio: {loss_ratio:.2f}% of MLP's contribution captured by autoencoder")
-    
-#     return loss_ratio, losses
-
-def plot_activation_frequencies_comparison(transformer_activations, autoencoder, device):
+def get_autoencoder_activations(transformer_activations, autoencoder, device, batch_size=256):
     """
-    Creates a histogram comparing neuron activation frequencies between transformer layer
-    and sparse autoencoder hidden layer activations.
+    Process transformer activations through autoencoder encoder in batches.
     
     Args:
         transformer_activations: Flattened tensor of transformer activations (batch_size * seq_len, hidden_dim)
         autoencoder: Trained sparse autoencoder model
         device: Device to run computations on
+        batch_size: Size of batches to process at once
+        
+    Returns:
+        numpy array of autoencoder activations
+    """
+    total_examples = transformer_activations.size(0)
+    autoencoder_acts_list = []
+    
+    print(f"\nProcessing {total_examples} examples in batches of {batch_size}")
+    for start_idx in tqdm(range(0, total_examples, batch_size)):
+        end_idx = min(start_idx + batch_size, total_examples)
+        batch = transformer_activations[start_idx:end_idx]
+        
+        with torch.no_grad():
+            # Forward pass through encoder only to get hidden representations
+            _, encoded = autoencoder(batch)
+            autoencoder_acts_list.append(encoded.cpu())
+    
+    # Concatenate all batches
+    return torch.cat(autoencoder_acts_list, dim=0).numpy()
+
+def plot_activation_frequencies_comparison(transformer_activations, autoencoder, device, batch_size=256):
+    """
+    Creates a histogram comparing neuron activation frequencies between transformer layer
+    and sparse autoencoder hidden layer activations. Processes activations in batches to handle large tensors.
+    
+    Args:
+        transformer_activations: Flattened tensor of transformer activations (batch_size * seq_len, hidden_dim)
+        autoencoder: Trained sparse autoencoder model
+        device: Device to run computations on
+        batch_size: Size of batches to process at once
     """
     # Get transformer activations
     transformer_acts = transformer_activations.cpu().numpy()
     transformer_frequencies = (transformer_acts > 1e-12).mean(axis=0) * 100  # Convert to percentage
     
-    # Get autoencoder hidden layer activations
-    with torch.no_grad():
-        # Forward pass through encoder only to get hidden representations
-        _, encoded = autoencoder(transformer_activations)
-        autoencoder_acts = encoded.cpu().numpy()
-        autoencoder_frequencies = (autoencoder_acts > 1e-12).mean(axis=0) * 100
+    # Get autoencoder activations using the helper function
+    autoencoder_acts = get_autoencoder_activations(transformer_activations, autoencoder, device, batch_size)
+    autoencoder_frequencies = (autoencoder_acts > 1e-12).mean(axis=0) * 100
     
     # Create figure with log-scale x-axis
     plt.figure(figsize=(12, 8))
@@ -538,6 +216,573 @@ def plot_activation_frequencies_comparison(transformer_activations, autoencoder,
 
     return transformer_frequencies, autoencoder_frequencies
 
+def collect_activations_batched(model, data_loader, device, num_target_tokens):
+    print("\n=== Starting Activation Collection ===")
+    print(f"Using num_target_tokens: {num_target_tokens}")
+    activations = []
+    modality_labels = []  # List to store modality labels
+    examples_processed = 0
+    
+    def hook_fn(module, input, output):
+        print(f'\nHook received output shape: {output.shape}')
+        # Save activations
+        activations.append(output.clone().detach().cpu())
+    
+    # register hook on the spatial attention layer
+    ninth_decoder_block = model.decoder[8]
+    hook = ninth_decoder_block.register_forward_hook(hook_fn)
+    print(f"Registered hook on decoder block 8")
+
+    with torch.no_grad():
+        for batch_idx, data in enumerate(data_loader):
+            print(f"\nProcessing batch {batch_idx + 1}")
+            
+            # Get current batch size from the data
+            current_batch_size = next(iter(data.values()))['tensor'].shape[0]
+                
+            print(f"Processing full batch of {current_batch_size} examples")
+            
+            # Move data to device
+            processed_data = {}
+            for mod, d in data.items():
+                processed_data[mod] = {k: v.to(device) if isinstance(v, torch.Tensor) else v 
+                                      for k, v in d.items()}
+            
+            print("Data moved to device")
+            
+            # Prepare input dictionary and target mask
+            input_dict = {}
+            target_mask = {}
+            
+            # Track which modality each token comes from
+            batch_modality_labels = []
+            total_tokens = 0
+            
+            for mod, d in processed_data.items():
+                if mod in model.encoder_embeddings:
+                    input_dict[mod] = d['tensor']
+
+                if mod in model.decoder_embeddings:
+                    target_mask[mod] = d['target_mask']
+                    # Get the modality ID from the model's modality info
+                    mod_id = model.modality_info[mod]["id"]
+                    # Get the number of tokens for this modality
+                    num_tokens = d['tensor'].shape[1]
+                    # Only create labels for tokens up to num_target_tokens
+                    num_tokens = min(num_tokens, num_target_tokens)
+                    # Create labels for these tokens
+                    batch_modality_labels.append(torch.full((current_batch_size, num_tokens), mod_id, dtype=torch.long, device='cpu'))
+                    total_tokens += num_tokens
+            
+            # Concatenate modality labels for this batch
+            if batch_modality_labels:
+                batch_modality_tensor = torch.cat(batch_modality_labels, dim=1)
+                # Ensure we only have num_target_tokens tokens
+                if batch_modality_tensor.shape[1] > num_target_tokens:
+                    batch_modality_tensor = batch_modality_tensor[:, :num_target_tokens]
+                # Pad to match the model's sequence length (256)
+                if batch_modality_tensor.shape[1] < 256:
+                    padding = torch.full((current_batch_size, 256 - batch_modality_tensor.shape[1]), 
+                                       -1, dtype=torch.long, device='cpu')
+                    batch_modality_tensor = torch.cat([batch_modality_tensor, padding], dim=1)
+                modality_labels.append(batch_modality_tensor)
+            else:
+                print("Warning: No modality labels created for this batch")
+                modality_labels.append(torch.full((current_batch_size, 256), -1, dtype=torch.long, device='cpu'))
+
+            # Run the batch through the model
+            print("\nRunning forward pass...")
+            output = model(input_dict, target_mask)
+
+            torch.cuda.empty_cache()
+
+            examples_processed += current_batch_size
+            print(f"Total examples processed: {examples_processed}")
+            
+    # Remove the hook
+    hook.remove()
+    print("\nHook removed")
+    
+    # Concatenate all activations
+    print("\nConcatenating activations...")
+    activations_tensor = torch.cat(activations, dim=0)
+    print(f"Final activations shape: {activations_tensor.shape}")
+    print(f"Final activations dtype: {activations_tensor.dtype}")
+    print(f"Final activations device: {activations_tensor.device}")
+    
+    # Concatenate all modality labels
+    print("\nConcatenating modality labels...")
+    modality_labels_tensor = torch.cat(modality_labels, dim=0)
+    print(f"Final modality labels shape: {modality_labels_tensor.shape}")
+    print(f"Final modality labels dtype: {modality_labels_tensor.dtype}")
+    print(f"Final modality labels device: {modality_labels_tensor.device}")
+    
+    # Verify shapes match before flattening
+    assert activations_tensor.shape[:2] == modality_labels_tensor.shape, \
+        f"Shape mismatch: activations {activations_tensor.shape[:2]} vs labels {modality_labels_tensor.shape}"
+    
+    # Flatten activations
+    print("\nFlattening activations...")
+    # Get original shape dimensions
+    sample_size, seq_length, embed_dim = activations_tensor.shape
+    # Reshape to [sample_size*seq_length, embed_dim] instead of [sample_size, seq_length*embed_dim]
+    activations_tensor_flat = activations_tensor.reshape(sample_size * seq_length, embed_dim)
+    print(f"Original activations shape: {activations_tensor.shape} -> [sample_size, seq_length, embed_dim]")
+    print(f"Flattened activations shape: {activations_tensor_flat.shape} -> [sample_size*seq_length, embed_dim]")
+    print(f"Flattened activations dtype: {activations_tensor_flat.dtype}")
+    print(f"Flattened activations device: {activations_tensor_flat.device}")
+    
+    # Flatten modality labels to match the flattened activations
+    modality_labels_flat = modality_labels_tensor.reshape(-1)
+    print(f"Flattened modality labels shape: {modality_labels_flat.shape}")
+    print(f"Flattened modality labels dtype: {modality_labels_flat.dtype}")
+    print(f"Flattened modality labels device: {modality_labels_flat.device}")
+    
+    # Verify shapes match after flattening
+    assert len(activations_tensor_flat) == len(modality_labels_flat), \
+        f"Length mismatch after flattening: activations {len(activations_tensor_flat)} vs labels {len(modality_labels_flat)}"
+    
+    # Print unique modality values for verification
+    unique_modalities = torch.unique(modality_labels_flat)
+    print(f"Unique modality values in labels: {unique_modalities.tolist()}")
+    
+    # Print modality distribution
+    for mod_id in unique_modalities:
+        if mod_id != -1:  # Skip padding tokens
+            count = (modality_labels_flat == mod_id).sum().item()
+            percentage = (count / len(modality_labels_flat)) * 100
+            # Try to get modality name from model's modality_info
+            mod_name = next((mod for mod, info in model.modality_info.items() if info["id"] == mod_id), f"Unknown-{mod_id}")
+            print(f"Modality {mod_name} (ID: {mod_id}): {count} tokens ({percentage:.2f}%)")
+    
+    # Print padding token distribution
+    padding_count = (modality_labels_flat == -1).sum().item()
+    padding_percentage = (padding_count / len(modality_labels_flat)) * 100
+    print(f"Padding tokens (-1): {padding_count} tokens ({padding_percentage:.2f}%)")
+    
+    return activations_tensor_flat, modality_labels_flat, examples_processed
+
+class NewtonRaphsonLogisticRegression:
+    """1D logistic regression using Newton-Raphson optimization"""
+    def __init__(self, max_iter=100, tol=1e-8):
+        self.max_iter = max_iter
+        self.tol = tol
+        self.w = None
+        self.b = None
+    
+    def _sigmoid(self, z):
+        """Sigmoid activation function"""
+        return 1 / (1 + np.exp(-np.clip(z, -30, 30)))  # Clip to avoid overflow
+    
+    def _loss(self, params, X, y):
+        """Binary cross-entropy loss"""
+        w, b = params
+        z = w * X + b
+        y_pred = self._sigmoid(z)
+        # Avoid log(0) errors
+        epsilon = 1e-15
+        y_pred = np.clip(y_pred, epsilon, 1 - epsilon)
+        return -np.mean(y * np.log(y_pred) + (1 - y) * np.log(1 - y_pred))
+    
+    def _gradient(self, params, X, y):
+        """Gradient of loss with respect to parameters"""
+        w, b = params
+        z = w * X + b
+        y_pred = self._sigmoid(z)
+        error = y_pred - y
+        grad_w = np.mean(error * X)
+        grad_b = np.mean(error)
+        return np.array([grad_w, grad_b])
+    
+    def _hessian(self, params, X, y):
+        """Hessian matrix (second derivatives)"""
+        w, b = params
+        z = w * X + b
+        y_pred = self._sigmoid(z)
+        diag = y_pred * (1 - y_pred)
+        H_ww = np.mean(diag * X * X)
+        H_wb = np.mean(diag * X)
+        H_bb = np.mean(diag)
+        return np.array([[H_ww, H_wb], [H_wb, H_bb]])
+    
+    def fit(self, X, y):
+        """Fit the model using Newton-Raphson method"""
+        # Initialize parameters
+        params = np.zeros(2)  # [w, b]
+        
+        for _ in range(self.max_iter):
+            # Calculate gradient and Hessian
+            gradient = self._gradient(params, X, y)
+            hessian = self._hessian(params, X, y)
+            
+            # Newton update: params = params - H^(-1) * gradient
+            try:
+                update = np.linalg.solve(hessian, gradient)
+            except np.linalg.LinAlgError:
+                # If Hessian is singular, add small value to diagonal
+                hessian = hessian + np.eye(2) * 1e-6
+                update = np.linalg.solve(hessian, gradient)
+            
+            # Update parameters
+            params = params - update
+            
+            # Check convergence
+            if np.linalg.norm(update) < self.tol:
+                break
+        
+        self.w, self.b = params
+        return self
+    
+    def predict_proba(self, X):
+        """Predict probability of class 1"""
+        z = self.w * X + self.b
+        return self._sigmoid(z)
+    
+    def predict(self, X, threshold=0.5):
+        """Predict class labels"""
+        return (self.predict_proba(X) >= threshold).astype(int)
+
+def apply_logistic_probe(
+    activations_tensor_flat, 
+    modality_labels_flat, 
+    examples_processed, 
+    autoencoder, 
+    device,
+    image_modality_id=18665,  # ID for tok_image
+    output_prefix='tok_image',  # Prefix for output files
+    test_size=0.2,
+    random_state=42
+):
+    # Apply 1D logistic probe to find whether latent has info on whether the input is an image or not
+    # Save both tensors for later use
+    torch.save({
+        'activations': activations_tensor_flat,
+        'modality_labels': modality_labels_flat,
+        'examples_processed': examples_processed
+    }, f'{output_prefix}_activations_with_modality_labels.pt')
+    
+    print(f"\nSaved activations and modality labels to '{output_prefix}_activations_with_modality_labels.pt'")
+    print(f"Activations shape: {activations_tensor_flat.shape}")
+    print(f"Modality labels shape: {modality_labels_flat.shape}")
+    print(f"Unique modality values: {torch.unique(modality_labels_flat).tolist()}")
+
+    # Filter out padding tokens (-1)
+    print("\nFiltering out padding tokens...")
+    valid_mask = (modality_labels_flat != -1)
+    valid_activations = activations_tensor_flat[valid_mask]
+    valid_labels = modality_labels_flat[valid_mask]
+
+    print(f"Original dataset size: {len(modality_labels_flat)}")
+    print(f"Dataset size after removing padding: {len(valid_labels)}")
+    print(f"Removed {len(modality_labels_flat) - len(valid_labels)} padding tokens")
+
+    # Create binary labels for image tokens
+    image_labels = (valid_labels == image_modality_id).long()
+    print(f"\nCreated binary labels for tok_image modality:")
+    print(f"Number of image tokens: {image_labels.sum().item()}")
+    print(f"Number of non-image tokens: {len(image_labels) - image_labels.sum().item()}")
+    print(f"Percentage of image tokens: {(image_labels.sum().item() / len(image_labels) * 100):.2f}%")
+
+    # Verify we have no padding tokens
+    assert -1 not in np.unique(valid_labels), "Found padding tokens in labels after filtering!"
+    print("\nVerified: No padding tokens in the dataset")
+
+    # Prepare the dataset for probing
+    print("\nPreparing dataset for probing...")
+    # Convert tensors to numpy for sklearn compatibility
+    activations_np = valid_activations.cpu().numpy()
+    labels_np = image_labels.cpu().numpy()
+
+    # Split data into train and test sets
+    X_train, X_test, y_train, y_test = train_test_split(
+        activations_np, labels_np, 
+        test_size=test_size, 
+        random_state=random_state,
+        stratify=labels_np  # Ensure balanced split
+    )
+    print(f"Training set size: {len(X_train)}")
+    print(f"Test set size: {len(X_test)}")
+    print(f"Training set image token percentage: {(y_train.sum() / len(y_train) * 100):.2f}%")
+    print(f"Test set image token percentage: {(y_test.sum() / len(y_test) * 100):.2f}%")
+
+    # Get autoencoder activations for both train and test sets
+    print("\nGetting autoencoder activations...")
+    with torch.no_grad():
+        # Process training set
+        train_acts = torch.tensor(X_train, dtype=torch.float32, device=device)
+        _, train_latents = autoencoder(train_acts)
+        train_latents = train_latents.cpu().numpy()
+        
+        # Process test set
+        test_acts = torch.tensor(X_test, dtype=torch.float32, device=device)
+        _, test_latents = autoencoder(test_acts)
+        test_latents = test_latents.cpu().numpy()
+
+    # Probe each latent dimension
+    print("\nProbing all latent dimensions...")
+    # num_latents = train_latents.shape[1]
+    num_latents = 10
+    print(f"Total number of latents to probe: {num_latents}")
+    results = []
+    
+    # Calculate class weights for balanced loss
+    class_counts = np.bincount(y_train)
+    total_samples = len(y_train)
+    class_weights = total_samples / (2 * class_counts)  # 2 classes
+    print(f"\nClass weights for balanced loss: {class_weights}")
+    print(f"Class distribution: {class_counts}")
+    print(f"Percentage of image tokens: {(class_counts[1] / total_samples * 100):.2f}%")
+    
+    # Calculate baseline metrics
+    majority_class = np.argmax(class_counts)
+    baseline_accuracy = class_counts[majority_class] / total_samples
+    print(f"\nBaseline metrics (always predicting majority class):")
+    print(f"Accuracy: {baseline_accuracy:.4f}")
+    print(f"Balanced accuracy: 0.5 (random chance)")
+    print(f"F1 score: 0.0 (no true positives)")
+    
+    for i in tqdm(range(num_latents), desc="Probing latents"):
+        # Extract activations for this latent
+        z_i_train = train_latents[:, i]
+        z_i_test = test_latents[:, i]
+        
+        # Train logistic regression with class weights
+        model = NewtonRaphsonLogisticRegression()
+        # Modify the loss function to use class weights
+        model._loss = lambda params, X, y: -np.mean(
+            class_weights[y] * (y * np.log(model._sigmoid(params[0] * X + params[1])) + 
+                              (1 - y) * np.log(1 - model._sigmoid(params[0] * X + params[1])))
+        )
+        model.fit(z_i_train, y_train)
+        
+        # Evaluate on test set
+        y_pred_proba = model.predict_proba(z_i_test)
+        y_pred = (y_pred_proba >= 0.5).astype(int)
+        
+        # Calculate various metrics
+        accuracy = (y_pred == y_test).mean()
+        balanced_acc = balanced_accuracy_score(y_test, y_pred)
+        f1 = f1_score(y_test, y_pred)
+        # Calculate balanced cross-entropy loss
+        balanced_loss = -np.mean(
+            class_weights[y_test] * (y_test * np.log(np.clip(y_pred_proba, 1e-15, 1-1e-15)) + 
+                                   (1 - y_test) * np.log(np.clip(1 - y_pred_proba, 1e-15, 1-1e-15)))
+        )
+        
+        results.append({
+            'latent_index': i,
+            'weight': model.w,
+            'bias': model.b,
+            'accuracy': accuracy,
+            'balanced_accuracy': balanced_acc,
+            'f1_score': f1,
+            'balanced_cross_entropy_loss': balanced_loss
+        })
+    
+    # Convert results to DataFrame and sort by balanced accuracy
+    results_df = pd.DataFrame(results)
+    results_df = results_df.sort_values('balanced_accuracy', ascending=False)
+    
+    # Save all results
+    results_df.to_csv(f'{output_prefix}_probing_results_all_balanced.csv', index=False)
+    print(f"\nResults saved to '{output_prefix}_probing_results_all_balanced.csv'")
+    
+    # Get top 10 latents
+    top_10_df = results_df.head(10)
+    
+    # Print top 10 results
+    print("\nTop 10 best latents (sorted by balanced accuracy):")
+    print(top_10_df[['latent_index', 'balanced_accuracy', 'f1_score', 'balanced_cross_entropy_loss']].to_string())
+    
+    # Print summary statistics of all latents
+    print("\nSummary statistics of all latents:")
+    print(f"Best balanced accuracy: {results_df['balanced_accuracy'].max():.4f}")
+    print(f"Worst balanced accuracy: {results_df['balanced_accuracy'].min():.4f}")
+    print(f"Mean balanced accuracy: {results_df['balanced_accuracy'].mean():.4f}")
+    print(f"Median balanced accuracy: {results_df['balanced_accuracy'].median():.4f}")
+    print(f"Number of latents better than random (balanced accuracy > 0.5): {(results_df['balanced_accuracy'] > 0.5).sum()}")
+    
+    # Create a figure with two subplots
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(15, 6))
+    
+    # Plot 1: Distribution of balanced accuracies for all latents
+    ax1.hist(results_df['balanced_accuracy'], bins=50)
+    ax1.axvline(0.5, color='r', linestyle='--', label='Random Chance')
+    ax1.set_xlabel('Balanced Accuracy')
+    ax1.set_ylabel('Number of Latents')
+    ax1.set_title('Distribution of Balanced Accuracies\n(All Latents)')
+    ax1.legend()
+    
+    # Plot 2: Bar plot of balanced accuracies for top 10 latents
+    top_10_df.plot(kind='bar', x='latent_index', y='balanced_accuracy', ax=ax2)
+    ax2.axhline(0.5, color='r', linestyle='--', label='Random Chance')
+    ax2.set_xlabel('Latent Index')
+    ax2.set_ylabel('Balanced Accuracy')
+    ax2.set_title('Balanced Accuracies of Top 10 Latents')
+    ax2.legend()
+    
+    plt.tight_layout()
+    plt.savefig(f'{output_prefix}_probing_analysis.png')
+    print(f"\nSaved analysis plots to '{output_prefix}_probing_analysis.png'")
+    
+    # Additional plot: Scatter plot of balanced accuracy vs latent index
+    plt.figure(figsize=(12, 6))
+    plt.scatter(results_df['latent_index'], results_df['balanced_accuracy'], alpha=0.5)
+    plt.axhline(0.5, color='r', linestyle='--', label='Random Chance')
+    plt.xlabel('Latent Index')
+    plt.ylabel('Balanced Accuracy')
+    plt.title('Balanced Accuracy vs Latent Index')
+    plt.legend()
+    plt.savefig(f'{output_prefix}_probing_scatter.png')
+    print(f"Saved scatter plot to '{output_prefix}_probing_scatter.png'")
+
+def plot_tsne_visualization(activations_tensor_flat, modality_labels_flat, autoencoder, device, 
+                          image_modality_id=18665, output_prefix='tok_image', perplexity=30, 
+                          n_iter=1000, random_state=42):
+    """
+    Create TSNE visualization of activations with different colors for image vs non-image tokens.
+    
+    Args:
+        activations_tensor_flat: Flattened tensor of activations [n_samples, hidden_dim]
+        modality_labels_flat: Flattened tensor of modality labels [n_samples]
+        autoencoder: Trained sparse autoencoder model
+        device: Device to run computations on
+        image_modality_id: ID for image modality tokens
+        output_prefix: Prefix for output files
+        perplexity: TSNE perplexity parameter
+        n_iter: Number of TSNE iterations
+        random_state: Random seed for reproducibility
+    """
+    print("\nStarting TSNE visualization...")
+    
+    # Move tensors to CPU to avoid CUDA memory issues
+    print("Moving tensors to CPU...")
+    activations_tensor_flat = activations_tensor_flat.cpu()
+    modality_labels_flat = modality_labels_flat.cpu()
+    
+    # Filter out padding tokens (-1)
+    print("Filtering padding tokens...")
+    valid_mask = modality_labels_flat != -1
+    activations_filtered = activations_tensor_flat[valid_mask]
+    labels_filtered = modality_labels_flat[valid_mask]
+    
+    print(f"Filtered activations shape: {activations_filtered.shape}")
+    print(f"Number of valid samples: {valid_mask.sum().item()}")
+    
+    # Take a subset of the data for TSNE (20% of the data)
+    print("\nTaking subset of data for TSNE...")
+    subset_size = len(activations_filtered) // 5
+    indices = torch.randperm(len(activations_filtered))[:subset_size]
+    activations_subset = activations_filtered[indices]
+    labels_subset = labels_filtered[indices]
+    
+    print(f"Subset size: {subset_size} samples")
+    print(f"Image tokens in subset: {(labels_subset == image_modality_id).sum().item()}")
+    
+    # Process autoencoder activations in chunks to avoid memory issues
+    chunk_size = 10000
+    autoencoder_acts_list = []
+    
+    print("\nProcessing activations through autoencoder...")
+    for start_idx in tqdm(range(0, len(activations_subset), chunk_size)):
+        end_idx = min(start_idx + chunk_size, len(activations_subset))
+        chunk = activations_subset[start_idx:end_idx].to(device)
+        
+        with torch.no_grad():
+            try:
+                _, encoded = autoencoder(chunk)
+                autoencoder_acts_list.append(encoded.cpu())
+                # Clear CUDA cache after each chunk
+                torch.cuda.empty_cache()
+            except Exception as e:
+                print(f"Error processing chunk {start_idx}-{end_idx}: {str(e)}")
+                import traceback
+                print(f"Traceback:\n{traceback.format_exc()}")
+                continue
+    
+    # Concatenate all chunks
+    print("\nConcatenating autoencoder activations...")
+    autoencoder_acts = torch.cat(autoencoder_acts_list, dim=0)
+    print(f"Autoencoder activations shape: {autoencoder_acts.shape}")
+    
+    # Convert to numpy and free GPU memory
+    print("Converting to numpy array...")
+    autoencoder_acts_np = autoencoder_acts.numpy()
+    del autoencoder_acts
+    del autoencoder_acts_list
+    torch.cuda.empty_cache()
+    
+    # Apply TSNE with memory-efficient settings
+    print("\nApplying TSNE...")
+    try:
+        print("Initializing TSNE with parameters:")
+        print(f"- perplexity: {perplexity}")
+        print(f"- n_iter: {n_iter}")
+        print(f"- random_state: {random_state}")
+        print(f"- n_jobs: -1 (using all CPU cores)")
+        print(f"- method: barnes_hut (memory efficient)")
+        print(f"- angle: 0.5 (trade-off between accuracy and speed)")
+        
+        # Use more memory-efficient settings
+        tsne = TSNE(
+            n_components=2,
+            perplexity=min(perplexity, 30),  # Cap perplexity at 30
+            n_iter=min(n_iter, 500),  # Reduce iterations
+            random_state=random_state,
+            verbose=2,  # More verbose output
+            n_jobs=-1,  # Use all CPU cores
+            method='barnes_hut',  # More memory efficient method
+            angle=0.5,  # Trade-off between accuracy and speed
+            init='pca'  # Use PCA initialization for better convergence
+        )
+        
+        print("Starting TSNE fit_transform...")
+        latents_2d = tsne.fit_transform(autoencoder_acts_np)
+        print("TSNE completed successfully")
+        
+        # Free memory
+        del autoencoder_acts_np
+        torch.cuda.empty_cache()
+        
+    except Exception as e:
+        print(f"Error during TSNE: {str(e)}")
+        import traceback
+        print(f"Traceback:\n{traceback.format_exc()}")
+        return None, None
+    
+    # Create visualization
+    print("\nCreating visualization...")
+    plt.figure(figsize=(12, 8))
+    
+    # Plot all points
+    print("Plotting points...")
+    plt.scatter(latents_2d[:, 0], latents_2d[:, 1], c='gray', alpha=0.1, s=1, label='Other modalities')
+    
+    # Highlight image modality
+    print("Highlighting image modality...")
+    image_mask = labels_subset == image_modality_id
+    if image_mask.any():
+        plt.scatter(latents_2d[image_mask, 0], latents_2d[image_mask, 1], 
+                   c='red', alpha=0.5, s=2, label='Image modality')
+    
+    plt.title('t-SNE Visualization of Autoencoder Activations (20% Subset)')
+    plt.xlabel('t-SNE dimension 1')
+    plt.ylabel('t-SNE dimension 2')
+    plt.legend()
+    
+    # Save plot
+    print("Saving plot...")
+    output_file = f'{output_prefix}_tsne_subset.png'
+    plt.savefig(output_file, dpi=300, bbox_inches='tight')
+    plt.close()
+    print(f"Saved visualization to {output_file}")
+    
+    # Clean up
+    print("Cleaning up...")
+    torch.cuda.empty_cache()
+    
+    return latents_2d, None
+
 if __name__ == '__main__':
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
@@ -550,33 +795,54 @@ if __name__ == '__main__':
     model = model.to(device).eval()  
     print(f"Model architecture:\n{model}")
 
-    # Define the sparse autoencoder
+    # Load the sparse autoencoder
     input_size = 768
     hidden_size = input_size*4
+    k = max(1, int(hidden_size * 0.02))  # Use 2% sparsity by default
     autoencoder = SparseAutoencoder(input_size, hidden_size).to(device)
-    # autoencoder.load_state_dict(torch.load('best_llm_sae_elegant-xwing-8.pth', weights_only=True, map_location=device))
-    autoencoder.load_state_dict(torch.load('best_llm_sae_fancy-snowflake-9.pth', weights_only=True, map_location=device))
+    autoencoder.load_state_dict(torch.load('best_llm_sae_rural-wood-16.pth', weights_only=True, map_location=device))   
+
+    # # Set this flag to True to use a randomly initialized autoencoder for testing
+    # USE_RANDOM_AUTOENCODER = True
+
+    # if USE_RANDOM_AUTOENCODER:
+    #     print("\n=== Using randomly initialized autoencoder for test analysis ===")
+    #     autoencoder = SparseAutoencoder(input_size, hidden_size, k=k).to(device)
+    # else:
+    #     autoencoder = SparseAutoencoder(input_size, hidden_size, k=k).to(device)
+    #     # Load state dict, removing 'encoder.bias' if present and handling missing 'bias'
+    #     state_dict = torch.load('best_llm_sae_fresh-voice-15.pth', map_location=device)
+    #     if 'encoder.bias' in state_dict:
+    #         print('Removing encoder.bias from state_dict')
+    #         del state_dict['encoder.bias']
+    #     missing, unexpected = autoencoder.load_state_dict(state_dict, strict=False)
+    #     print('Missing keys:', missing)
+    #     print('Unexpected keys:', unexpected)
+
+
     autoencoder.eval()
     print(f"Autoencoder loaded")
 
-    # Read in activations
-    activations_path = '/mnt/home/rzhang/ceph/activations_4992examples.pt'
-    activations_tensor_flat = torch.load(activations_path, map_location=device, weights_only=True)
+    # # Read in activations
+    # activations_path = '/mnt/home/rzhang/ceph/activations_4992examples.pt'
+    # activations_tensor_flat = torch.load(activations_path, map_location=device, weights_only=True)
 
     # Load tokenized training data
     print("\n=== Setting Up Data ===")
-
     args = Args()
+    print(f"Args batch size: {args.batch_size}")
+    print(f"Args num workers: {args.num_workers}")
+    print(f"Args epoch size: {args.epoch_size}")
     
-    # Count examples in the shard before setting up the data loader
-    shard_path = args.data_config
-    with open(shard_path, "r") as f:
-        data_config = yaml.safe_load(f)
-        # Find the sdss_legacysurvey dataset path
-        for dataset_name, dataset_cfg in data_config['train']['datasets'].items():
-            if dataset_name == 'sdss_legacysurvey':
-                shard_path = dataset_cfg['data_path']
-                break
+    # # Count examples in the shard before setting up the data loader
+    # shard_path = args.data_config
+    # with open(shard_path, "r") as f:
+    #     data_config = yaml.safe_load(f)
+    #     # Find the sdss_legacysurvey dataset path
+    #     for dataset_name, dataset_cfg in data_config['train']['datasets'].items():
+    #         if dataset_name == 'sdss_legacysurvey':
+    #             shard_path = dataset_cfg['data_path']
+    #             break
     
     # num_examples = count_examples_in_shard(shard_path)
     # if num_examples is not None:
@@ -596,9 +862,106 @@ if __name__ == '__main__':
     #         print(f"Shape: {d['tensor'].shape}")
     #         print(f"Target mask shape: {d['target_mask'].shape}")
 
-    loss_ratio, losses = calculate_loss_ratio(model, data_loader_train, autoencoder, device)
-    print(f"Loss ratio: {loss_ratio:.2f}%")
-    print(f"Losses: {losses}")
+    # # Calculate loss ratio
+    # loss_ratio, losses = calculate_loss_ratio(model, data_loader_train, autoencoder, device)
+    # print(f"Loss ratio: {loss_ratio:.2f}%")
+    # print(f"Losses: {losses}")
 
-    transformer_frequencies, autoencoder_frequencies = plot_activation_frequencies_comparison(activations_tensor_flat, autoencoder, device)
+    # # Plot activation frequencies comparison
+    # transformer_frequencies, autoencoder_frequencies = plot_activation_frequencies_comparison(activations_tensor_flat, autoencoder, device)
+
+    # Collect activations and modality labels
+    activations_tensor_flat, modality_labels_flat, examples_processed = collect_activations_batched(
+        model, data_loader_train, device, num_target_tokens=args.num_target_tokens
+    )
+    # Apply the logistic probe on each latent dimension  
+    apply_logistic_probe(
+        activations_tensor_flat, 
+        modality_labels_flat, 
+        examples_processed, 
+        autoencoder, 
+        device,
+        image_modality_id=18665,  # ID for tok_image
+        output_prefix='tok_image',  # Prefix for output files
+        test_size=0.2,
+        random_state=42
+    )
+    
+    # print(f"Data loader created: {type(data_loader_train)}")
+    
+    # # Try to get a single batch to test the data loader
+    # print("\nTesting data loader with a single batch...")
+    # try:
+    #     test_batch = next(iter(data_loader_train))
+    #     print("Successfully got first batch!")
+    #     print(f"Batch keys: {list(test_batch.keys())}")
+    #     for mod, d in test_batch.items():
+    #         print(f"Modality {mod} tensor shape: {d['tensor'].shape}")
+    # except Exception as e:
+    #     print(f"Error getting first batch: {str(e)}")
+    #     import traceback
+    #     print(f"Traceback:\n{traceback.format_exc()}")
+    #     raise
+    
+    # print("\nStarting activation collection...")
+    # try:
+    #     # Collect activations and modality labels
+    #     activations_tensor_flat, modality_labels_flat, examples_processed = collect_activations_batched(
+    #         model, data_loader_train, device, num_target_tokens=args.num_target_tokens
+    #     )
+    #     print("Finished collecting activations!")
+        
+    #     # Save activations immediately
+    #     print("\nSaving activations...")
+    #     save_path = f'/mnt/home/rzhang/ceph/activations_{examples_processed}examples.pt'
+    #     torch.save({
+    #         'activations': activations_tensor_flat,
+    #         'modality_labels': modality_labels_flat,
+    #         'examples_processed': examples_processed
+    #     }, save_path)
+    #     print(f"Saved activations to {save_path}")
+        
+    #     # Clear data loader and CUDA cache
+    #     del data_loader_train
+    #     torch.cuda.empty_cache()
+        
+    #     # Run TSNE visualization
+    #     print("\nStarting TSNE visualization...")
+    #     latents_2d, latents_2d_alt = plot_tsne_visualization(
+    #         activations_tensor_flat,
+    #         modality_labels_flat,
+    #         autoencoder,
+    #         device,
+    #         image_modality_id=18665,
+    #         output_prefix='tok_image',
+    #         perplexity=30,
+    #         n_iter=1000,
+    #         random_state=42
+    #     )
+    #     print("Finished TSNE visualization!")
+        
+    # except Exception as e:
+    #     print(f"Error during processing: {str(e)}")
+    #     import traceback
+    #     print(f"Traceback:\n{traceback.format_exc()}")
+    # finally:
+    #     # Clean up
+    #     if 'data_loader_train' in locals():
+    #         del data_loader_train
+    #     torch.cuda.empty_cache()
+    #     print("\nCleanup completed")
+
+    # # After collecting activations, add TSNE visualization
+    # latents_2d, latents_2d_alt = plot_tsne_visualization(
+    #     activations_tensor_flat,
+    #     modality_labels_flat,
+    #     autoencoder,
+    #     device,
+    #     image_modality_id=18665,
+    #     output_prefix='tok_image',
+    #     perplexity=30,
+    #     n_iter=1000,
+    #     random_state=42
+    # )
+    
 
