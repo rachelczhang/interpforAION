@@ -451,8 +451,8 @@ def apply_logistic_probe(
     examples_processed, 
     autoencoder, 
     device,
-    image_modality_id=18665,  
-    output_prefix='tok_image',
+    image_modality_id=18665,  # ID for tok_image
+    output_prefix='tok_image', # Prefix for output files
     test_size=0.2,
     random_state=42
 ):
@@ -467,7 +467,7 @@ def apply_logistic_probe(
     print(f"\nSaved activations and modality labels to '{output_prefix}_activations_with_modality_labels.pt'")
     print(f"Activations shape: {activations_tensor_flat.shape}")
     print(f"Modality labels shape: {modality_labels_flat.shape}")
-    print(f"Unique label values: {torch.unique(modality_labels_flat).tolist()}")
+    print(f"Unique modality values: {torch.unique(modality_labels_flat).tolist()}")
 
     # Filter out padding tokens (-1) - keep only positions with actual predictions
     print("\nFiltering out padding tokens...")
@@ -533,7 +533,7 @@ def apply_logistic_probe(
     class_weights = total_samples / (2 * class_counts)  # 2 classes
     print(f"\nClass weights for balanced loss: {class_weights}")
     print(f"Class distribution: {class_counts}")
-    print(f"Percentage of image positions: {(class_counts[1] / total_samples * 100):.2f}%")
+    print(f"Percentage of image tokens: {(class_counts[1] / total_samples * 100):.2f}%")
     
     # Calculate baseline metrics
     majority_class = np.argmax(class_counts)
@@ -725,8 +725,8 @@ def apply_dense_probe_transformer(
     )
     print(f"Training set size: {len(X_train)}")
     print(f"Test set size: {len(X_test)}")
-    print(f"Training set image percentage: {(y_train.sum() / len(y_train) * 100):.2f}%")
-    print(f"Test set image percentage: {(y_test.sum() / len(y_test) * 100):.2f}%")
+    print(f"Training set image token percentage: {(y_train.sum() / len(y_train) * 100):.2f}%")
+    print(f"Test set image token percentage: {(y_test.sum() / len(y_test) * 100):.2f}%")
 
     # Calculate class weights for balanced loss
     class_counts = np.bincount(y_train)
