@@ -7,6 +7,7 @@ import seaborn as sns
 import numpy as np 
 import os 
 import sys
+import traceback
 from save_activations import get_data
 import torch.nn.functional as F
 from loss_ratio import calculate_loss_ratio
@@ -15,10 +16,13 @@ import tarfile
 from tqdm import tqdm
 import yaml
 from sklearn.model_selection import train_test_split
-from sklearn.metrics import log_loss, balanced_accuracy_score, f1_score
+from sklearn.metrics import log_loss, accuracy_score, balanced_accuracy_score, f1_score, roc_auc_score, roc_curve, confusion_matrix
+from sklearn.linear_model import LogisticRegression
 from scipy.optimize import minimize
 import pandas as pd
 from sklearn.manifold import TSNE
+from sklearn.decomposition import PCA
+from sklearn.preprocessing import StandardScaler
 # Get the current script's directory
 current_dir = os.path.dirname(os.path.abspath(__file__))
 
@@ -219,6 +223,7 @@ def plot_activation_frequencies_comparison(transformer_activations, autoencoder,
 def collect_activations_batched(model, data_loader, device, num_target_tokens):
     print("\n=== Starting Activation Collection ===")
     print(f"Using num_target_tokens: {num_target_tokens}")
+    
     activations = []
     modality_labels = []  # List to store modality labels
     examples_processed = 0
@@ -228,10 +233,14 @@ def collect_activations_batched(model, data_loader, device, num_target_tokens):
         # Save activations
         activations.append(output.clone().detach().cpu())
     
-    # register hook on the spatial attention layer
-    ninth_decoder_block = model.decoder[8]
-    hook = ninth_decoder_block.register_forward_hook(hook_fn)
-    print(f"Registered hook on decoder block 8")
+    # # register hook on the spatial attention layer
+    # ninth_decoder_block = model.decoder[8]
+    # hook = ninth_decoder_block.register_forward_hook(hook_fn)
+    # print(f"Registered hook on decoder block 8")
+    # TESTING ENCODER INSTEAD
+    ninth_encoder_block = model.encoder[8] 
+    hook = ninth_encoder_block.register_forward_hook(hook_fn)
+    print(f"Registered hook on encoder block 8")
 
     with torch.no_grad():
         for batch_idx, data in enumerate(data_loader):
@@ -253,17 +262,15 @@ def collect_activations_batched(model, data_loader, device, num_target_tokens):
             # Prepare input dictionary and target mask
             input_dict = {}
             target_mask = {}
-            
+
             # Track which modality each token comes from
             batch_modality_labels = []
             total_tokens = 0
             
+            # Collect input and target data
             for mod, d in processed_data.items():
                 if mod in model.encoder_embeddings:
                     input_dict[mod] = d['tensor']
-
-                if mod in model.decoder_embeddings:
-                    target_mask[mod] = d['target_mask']
                     # Get the modality ID from the model's modality info
                     mod_id = model.modality_info[mod]["id"]
                     # Get the number of tokens for this modality
@@ -273,6 +280,8 @@ def collect_activations_batched(model, data_loader, device, num_target_tokens):
                     # Create labels for these tokens
                     batch_modality_labels.append(torch.full((current_batch_size, num_tokens), mod_id, dtype=torch.long, device='cpu'))
                     total_tokens += num_tokens
+                if mod in model.decoder_embeddings:
+                    target_mask[mod] = d['target_mask']
             
             # Concatenate modality labels for this batch
             if batch_modality_labels:
@@ -290,15 +299,13 @@ def collect_activations_batched(model, data_loader, device, num_target_tokens):
                 print("Warning: No modality labels created for this batch")
                 modality_labels.append(torch.full((current_batch_size, 256), -1, dtype=torch.long, device='cpu'))
 
-            # Run the batch through the model
+            # Run the model
             print("\nRunning forward pass...")
             output = model(input_dict, target_mask)
 
             torch.cuda.empty_cache()
-
             examples_processed += current_batch_size
             print(f"Total examples processed: {examples_processed}")
-            
     # Remove the hook
     hook.remove()
     print("\nHook removed")
@@ -316,24 +323,20 @@ def collect_activations_batched(model, data_loader, device, num_target_tokens):
     print(f"Final modality labels shape: {modality_labels_tensor.shape}")
     print(f"Final modality labels dtype: {modality_labels_tensor.dtype}")
     print(f"Final modality labels device: {modality_labels_tensor.device}")
-    
+
     # Verify shapes match before flattening
     assert activations_tensor.shape[:2] == modality_labels_tensor.shape, \
         f"Shape mismatch: activations {activations_tensor.shape[:2]} vs labels {modality_labels_tensor.shape}"
     
-    # Flatten activations
+    # Flatten for analysis
     print("\nFlattening activations...")
-    # Get original shape dimensions
     sample_size, seq_length, embed_dim = activations_tensor.shape
-    # Reshape to [sample_size*seq_length, embed_dim] instead of [sample_size, seq_length*embed_dim]
     activations_tensor_flat = activations_tensor.reshape(sample_size * seq_length, embed_dim)
+    modality_labels_flat = modality_labels_tensor.reshape(-1)
     print(f"Original activations shape: {activations_tensor.shape} -> [sample_size, seq_length, embed_dim]")
     print(f"Flattened activations shape: {activations_tensor_flat.shape} -> [sample_size*seq_length, embed_dim]")
     print(f"Flattened activations dtype: {activations_tensor_flat.dtype}")
     print(f"Flattened activations device: {activations_tensor_flat.device}")
-    
-    # Flatten modality labels to match the flattened activations
-    modality_labels_flat = modality_labels_tensor.reshape(-1)
     print(f"Flattened modality labels shape: {modality_labels_flat.shape}")
     print(f"Flattened modality labels dtype: {modality_labels_flat.dtype}")
     print(f"Flattened modality labels device: {modality_labels_flat.device}")
@@ -448,8 +451,8 @@ def apply_logistic_probe(
     examples_processed, 
     autoencoder, 
     device,
-    image_modality_id=18665,  # ID for tok_image
-    output_prefix='tok_image',  # Prefix for output files
+    image_modality_id=18665,  
+    output_prefix='tok_image',
     test_size=0.2,
     random_state=42
 ):
@@ -464,9 +467,9 @@ def apply_logistic_probe(
     print(f"\nSaved activations and modality labels to '{output_prefix}_activations_with_modality_labels.pt'")
     print(f"Activations shape: {activations_tensor_flat.shape}")
     print(f"Modality labels shape: {modality_labels_flat.shape}")
-    print(f"Unique modality values: {torch.unique(modality_labels_flat).tolist()}")
+    print(f"Unique label values: {torch.unique(modality_labels_flat).tolist()}")
 
-    # Filter out padding tokens (-1)
+    # Filter out padding tokens (-1) - keep only positions with actual predictions
     print("\nFiltering out padding tokens...")
     valid_mask = (modality_labels_flat != -1)
     valid_activations = activations_tensor_flat[valid_mask]
@@ -502,8 +505,8 @@ def apply_logistic_probe(
     )
     print(f"Training set size: {len(X_train)}")
     print(f"Test set size: {len(X_test)}")
-    print(f"Training set image token percentage: {(y_train.sum() / len(y_train) * 100):.2f}%")
-    print(f"Test set image token percentage: {(y_test.sum() / len(y_test) * 100):.2f}%")
+    print(f"Training set image percentage: {(y_train.sum() / len(y_train) * 100):.2f}%")
+    print(f"Test set image percentage: {(y_test.sum() / len(y_test) * 100):.2f}%")
 
     # Get autoencoder activations for both train and test sets
     print("\nGetting autoencoder activations...")
@@ -520,8 +523,7 @@ def apply_logistic_probe(
 
     # Probe each latent dimension
     print("\nProbing all latent dimensions...")
-    # num_latents = train_latents.shape[1]
-    num_latents = 10
+    num_latents = train_latents.shape[1]
     print(f"Total number of latents to probe: {num_latents}")
     results = []
     
@@ -531,7 +533,7 @@ def apply_logistic_probe(
     class_weights = total_samples / (2 * class_counts)  # 2 classes
     print(f"\nClass weights for balanced loss: {class_weights}")
     print(f"Class distribution: {class_counts}")
-    print(f"Percentage of image tokens: {(class_counts[1] / total_samples * 100):.2f}%")
+    print(f"Percentage of image positions: {(class_counts[1] / total_samples * 100):.2f}%")
     
     # Calculate baseline metrics
     majority_class = np.argmax(class_counts)
@@ -563,6 +565,8 @@ def apply_logistic_probe(
         accuracy = (y_pred == y_test).mean()
         balanced_acc = balanced_accuracy_score(y_test, y_pred)
         f1 = f1_score(y_test, y_pred)
+        # Calculate AUC
+        auc = roc_auc_score(y_test, y_pred_proba)
         # Calculate balanced cross-entropy loss
         balanced_loss = -np.mean(
             class_weights[y_test] * (y_test * np.log(np.clip(y_pred_proba, 1e-15, 1-1e-15)) + 
@@ -576,6 +580,7 @@ def apply_logistic_probe(
             'accuracy': accuracy,
             'balanced_accuracy': balanced_acc,
             'f1_score': f1,
+            'auc': auc,
             'balanced_cross_entropy_loss': balanced_loss
         })
     
@@ -592,7 +597,7 @@ def apply_logistic_probe(
     
     # Print top 10 results
     print("\nTop 10 best latents (sorted by balanced accuracy):")
-    print(top_10_df[['latent_index', 'balanced_accuracy', 'f1_score', 'balanced_cross_entropy_loss']].to_string())
+    print(top_10_df[['latent_index', 'balanced_accuracy', 'f1_score', 'auc', 'balanced_cross_entropy_loss']].to_string())
     
     # Print summary statistics of all latents
     print("\nSummary statistics of all latents:")
@@ -601,6 +606,11 @@ def apply_logistic_probe(
     print(f"Mean balanced accuracy: {results_df['balanced_accuracy'].mean():.4f}")
     print(f"Median balanced accuracy: {results_df['balanced_accuracy'].median():.4f}")
     print(f"Number of latents better than random (balanced accuracy > 0.5): {(results_df['balanced_accuracy'] > 0.5).sum()}")
+    print(f"Best AUC: {results_df['auc'].max():.4f}")
+    print(f"Worst AUC: {results_df['auc'].min():.4f}")
+    print(f"Mean AUC: {results_df['auc'].mean():.4f}")
+    print(f"Median AUC: {results_df['auc'].median():.4f}")
+    print(f"Number of latents better than random (AUC > 0.5): {(results_df['auc'] > 0.5).sum()}")
     
     # Create a figure with two subplots
     fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(15, 6))
@@ -636,18 +646,254 @@ def apply_logistic_probe(
     plt.savefig(f'{output_prefix}_probing_scatter.png')
     print(f"Saved scatter plot to '{output_prefix}_probing_scatter.png'")
 
+    return results_df
+
+def apply_dense_probe_transformer(
+    activations_tensor_flat, 
+    modality_labels_flat, 
+    examples_processed,
+    image_modality_id=18665,  # Now used to identify image modality
+    output_prefix='image_transformer',  # Updated prefix
+    test_size=0.2,
+    random_state=42
+):
+    """
+    Apply dense logistic probe to ALL transformer neurons simultaneously to find whether 
+    they contain info on whether the position is predicting image modality or not.
+    
+    This uses all 768 dimensions together in a single model, rather than testing each individually.
+    
+    Args:
+        activations_tensor_flat: Flattened tensor of transformer activations [n_samples, 768]
+        modality_labels_flat: Flattened tensor of modality IDs [n_samples] (actual modality IDs, -1=padding)
+        examples_processed: Number of examples processed
+        image_modality_id: ID for image modality (used to create binary labels)
+        output_prefix: Prefix for output files
+        test_size: Fraction of data to use for testing
+        random_state: Random seed for reproducibility
+    """
+    print("\n=== Starting Dense Probing on ALL Transformer Neurons ===")
+    
+    # Save both tensors for later use
+    torch.save({
+        'activations': activations_tensor_flat,
+        'modality_labels': modality_labels_flat,
+        'examples_processed': examples_processed
+    }, f'{output_prefix}_activations_with_modality_labels.pt')
+    
+    print(f"\nSaved activations and modality labels to '{output_prefix}_activations_with_modality_labels.pt'")
+    print(f"Activations shape: {activations_tensor_flat.shape}")
+    print(f"Modality labels shape: {modality_labels_flat.shape}")
+    print(f"Unique label values: {torch.unique(modality_labels_flat).tolist()}")
+
+    # Filter out padding tokens (-1) - keep only positions with actual predictions
+    print("\nFiltering out padding tokens...")
+    valid_mask = (modality_labels_flat != -1)
+    valid_activations = activations_tensor_flat[valid_mask]
+    valid_labels = modality_labels_flat[valid_mask]
+
+    print(f"Original dataset size: {len(modality_labels_flat)}")
+    print(f"Dataset size after removing padding: {len(valid_labels)}")
+    print(f"Removed {len(modality_labels_flat) - len(valid_labels)} padding tokens")
+
+    # Create binary labels for image tokens
+    image_labels = (valid_labels == image_modality_id).long()
+    print(f"\nCreated binary labels for tok_image modality:")
+    print(f"Number of image tokens: {image_labels.sum().item()}")
+    print(f"Number of non-image tokens: {len(image_labels) - image_labels.sum().item()}")
+    print(f"Percentage of image tokens: {(image_labels.sum().item() / len(image_labels) * 100):.2f}%")
+
+    # Verify we have no padding tokens
+    assert -1 not in np.unique(valid_labels), "Found padding tokens in labels after filtering!"
+    print("\nVerified: No padding tokens in the dataset")
+
+    # Prepare the dataset for probing
+    print("\nPreparing dataset for dense probing...")
+    # Convert tensors to numpy for sklearn compatibility
+    activations_np = valid_activations.cpu().numpy()
+    labels_np = image_labels.cpu().numpy()
+
+    print(f"Transformer activations shape: {activations_np.shape}")
+    print(f"Using ALL {activations_np.shape[1]} transformer neurons in a single dense model")
+
+    # Split data into train and test sets
+    X_train, X_test, y_train, y_test = train_test_split(
+        activations_np, labels_np, 
+        test_size=test_size, 
+        random_state=random_state,
+        stratify=labels_np  # Ensure balanced split
+    )
+    print(f"Training set size: {len(X_train)}")
+    print(f"Test set size: {len(X_test)}")
+    print(f"Training set image percentage: {(y_train.sum() / len(y_train) * 100):.2f}%")
+    print(f"Test set image percentage: {(y_test.sum() / len(y_test) * 100):.2f}%")
+
+    # Calculate class weights for balanced loss
+    class_counts = np.bincount(y_train)
+    total_samples = len(y_train)
+    class_weights_dict = {0: total_samples / (2 * class_counts[0]), 
+                         1: total_samples / (2 * class_counts[1])}
+    print(f"\nClass weights for balanced loss: {class_weights_dict}")
+    print(f"Class distribution: {class_counts}")
+    print(f"Percentage of image positions: {(class_counts[1] / total_samples * 100):.2f}%")
+    
+    # Calculate baseline metrics
+    majority_class = np.argmax(class_counts)
+    baseline_accuracy = class_counts[majority_class] / total_samples
+    print(f"\nBaseline metrics (always predicting majority class):")
+    print(f"Accuracy: {baseline_accuracy:.4f}")
+    print(f"Balanced accuracy: 0.5 (random chance)")
+    print(f"F1 score: 0.0 (no true positives)")
+    
+    # Train DENSE logistic regression using ALL neurons simultaneously
+    print(f"\nTraining dense logistic regression on all {activations_np.shape[1]} neurons...")
+    
+    # Use sklearn's LogisticRegression with balanced class weights
+    dense_model = LogisticRegression(
+        class_weight='balanced',  # Automatically handle class imbalance
+        random_state=random_state,
+        max_iter=1000  # Increase iterations for convergence
+    )
+    
+    print("Fitting dense model...")
+    dense_model.fit(X_train, y_train)
+    
+    # Evaluate on test set
+    print("Evaluating dense model...")
+    y_pred_proba = dense_model.predict_proba(X_test)[:, 1]  # Probability of positive class
+    y_pred = dense_model.predict(X_test)
+    
+    # Calculate various metrics
+    accuracy = accuracy_score(y_test, y_pred)
+    balanced_acc = balanced_accuracy_score(y_test, y_pred)
+    f1 = f1_score(y_test, y_pred)
+    auc = roc_auc_score(y_test, y_pred_proba)
+    
+    # Calculate balanced cross-entropy loss manually
+    class_weights_array = np.array([class_weights_dict[0], class_weights_dict[1]])
+    balanced_loss = -np.mean(
+        class_weights_array[y_test] * (y_test * np.log(np.clip(y_pred_proba, 1e-15, 1-1e-15)) + 
+                                     (1 - y_test) * np.log(np.clip(1 - y_pred_proba, 1e-15, 1-1e-15)))
+    )
+    
+    # Store results
+    results = {
+        'model_type': 'dense_logistic_regression',
+        'num_features': activations_np.shape[1],
+        'image_modality_id': image_modality_id,
+        'accuracy': accuracy,
+        'balanced_accuracy': balanced_acc,
+        'f1_score': f1,
+        'auc': auc,
+        'balanced_cross_entropy_loss': balanced_loss,
+        'model_coefficients': dense_model.coef_[0],  # Weights for each neuron
+        'model_intercept': dense_model.intercept_[0]
+    }
+    
+    # Print results
+    print(f"\n=== DENSE PROBE RESULTS ===")
+    print(f"Model uses ALL {activations_np.shape[1]} transformer neurons simultaneously")
+    print(f"Target: Modality {image_modality_id} vs all other modalities")
+    print(f"Accuracy: {accuracy:.4f}")
+    print(f"Balanced Accuracy: {balanced_acc:.4f}")
+    print(f"F1 Score: {f1:.4f}")
+    print(f"AUC: {auc:.4f}")
+    print(f"Balanced Cross-Entropy Loss: {balanced_loss:.4f}")
+    
+    # Compare to baseline
+    print(f"\n=== COMPARISON TO BASELINE ===")
+    print(f"Baseline accuracy (majority class): {baseline_accuracy:.4f}")
+    print(f"Dense probe accuracy: {accuracy:.4f}")
+    print(f"Improvement over baseline: {accuracy - baseline_accuracy:.4f}")
+    print(f"Dense probe balanced accuracy: {balanced_acc:.4f}")
+    print(f"Baseline balanced accuracy (random): 0.5000")
+    print(f"Improvement over random: {balanced_acc - 0.5:.4f}")
+    
+    # Analysis of model weights
+    coef_abs = np.abs(dense_model.coef_[0])
+    print(f"\n=== MODEL WEIGHT ANALYSIS ===")
+    print(f"Mean absolute weight: {coef_abs.mean():.6f}")
+    print(f"Max absolute weight: {coef_abs.max():.6f}")
+    print(f"Min absolute weight: {coef_abs.min():.6f}")
+    print(f"Number of near-zero weights (|w| < 0.001): {(coef_abs < 0.001).sum()}")
+    print(f"Top 10 most important neuron indices: {np.argsort(coef_abs)[-10:][::-1].tolist()}")
+    
+    # Save results
+    results_df = pd.DataFrame([results])
+    results_df.to_csv(f'{output_prefix}_dense_probing_results.csv', index=False)
+    print(f"\nResults saved to '{output_prefix}_dense_probing_results.csv'")
+    
+    # Save model weights for analysis
+    weights_df = pd.DataFrame({
+        'neuron_index': range(len(dense_model.coef_[0])),
+        'weight': dense_model.coef_[0],
+        'abs_weight': np.abs(dense_model.coef_[0])
+    }).sort_values('abs_weight', ascending=False)
+    weights_df.to_csv(f'{output_prefix}_model_weights.csv', index=False)
+    print(f"Model weights saved to '{output_prefix}_model_weights.csv'")
+    
+    # Create visualization
+    fig, ((ax1, ax2), (ax3, ax4)) = plt.subplots(2, 2, figsize=(15, 12))
+    
+    # Plot 1: ROC Curve
+    fpr, tpr, _ = roc_curve(y_test, y_pred_proba)
+    ax1.plot(fpr, tpr, label=f'Dense Probe (AUC = {auc:.3f})')
+    ax1.plot([0, 1], [0, 1], 'k--', label='Random Chance')
+    ax1.set_xlabel('False Positive Rate')
+    ax1.set_ylabel('True Positive Rate')
+    ax1.set_title('ROC Curve - Dense Probe')
+    ax1.legend()
+    
+    # Plot 2: Confusion Matrix
+    cm = confusion_matrix(y_test, y_pred)
+    im = ax2.imshow(cm, interpolation='nearest', cmap=plt.cm.Blues)
+    ax2.figure.colorbar(im, ax=ax2)
+    ax2.set_xlabel('Predicted Label')
+    ax2.set_ylabel('True Label')
+    ax2.set_title('Confusion Matrix')
+    # Add text annotations
+    thresh = cm.max() / 2.
+    for i in range(cm.shape[0]):
+        for j in range(cm.shape[1]):
+            ax2.text(j, i, format(cm[i, j], 'd'),
+                    ha="center", va="center",
+                    color="white" if cm[i, j] > thresh else "black")
+    
+    # Plot 3: Distribution of model weights
+    ax3.hist(dense_model.coef_[0], bins=50, alpha=0.7)
+    ax3.axvline(0, color='r', linestyle='--', label='Zero Weight')
+    ax3.set_xlabel('Model Weight')
+    ax3.set_ylabel('Number of Neurons')
+    ax3.set_title('Distribution of Model Weights')
+    ax3.legend()
+    
+    # Plot 4: Top 20 most important neurons
+    top_20_weights = weights_df.head(20)
+    ax4.barh(range(len(top_20_weights)), top_20_weights['abs_weight'])
+    ax4.set_yticks(range(len(top_20_weights)))
+    ax4.set_yticklabels(top_20_weights['neuron_index'])
+    ax4.set_xlabel('Absolute Weight')
+    ax4.set_ylabel('Neuron Index')
+    ax4.set_title('Top 20 Most Important Neurons')
+    
+    plt.tight_layout()
+    plt.savefig(f'{output_prefix}_dense_probe_analysis.png', dpi=300, bbox_inches='tight')
+    print(f"Analysis plots saved to '{output_prefix}_dense_probe_analysis.png'")
+    
+    return results, dense_model, weights_df
+
 def plot_tsne_visualization(activations_tensor_flat, modality_labels_flat, autoencoder, device, 
-                          image_modality_id=18665, output_prefix='tok_image', perplexity=30, 
+                          image_modality_id=18665, output_prefix='image_tsne', perplexity=30, 
                           n_iter=1000, random_state=42):
     """
-    Create TSNE visualization of activations with different colors for image vs non-image tokens.
+    Create TSNE visualization of activations with different colors for image vs non-image positions.
     
     Args:
         activations_tensor_flat: Flattened tensor of activations [n_samples, hidden_dim]
-        modality_labels_flat: Flattened tensor of modality labels [n_samples]
+        modality_labels_flat: Flattened tensor of binary labels [n_samples] (1=image, 0=non-image, -1=padding)
         autoencoder: Trained sparse autoencoder model
         device: Device to run computations on
-        image_modality_id: ID for image modality tokens
+        image_modality_id: ID for image modality (unused but kept for compatibility)
         output_prefix: Prefix for output files
         perplexity: TSNE perplexity parameter
         n_iter: Number of TSNE iterations
@@ -668,25 +914,17 @@ def plot_tsne_visualization(activations_tensor_flat, modality_labels_flat, autoe
     
     print(f"Filtered activations shape: {activations_filtered.shape}")
     print(f"Number of valid samples: {valid_mask.sum().item()}")
-    
-    # Take a subset of the data for TSNE (20% of the data)
-    print("\nTaking subset of data for TSNE...")
-    subset_size = len(activations_filtered) // 5
-    indices = torch.randperm(len(activations_filtered))[:subset_size]
-    activations_subset = activations_filtered[indices]
-    labels_subset = labels_filtered[indices]
-    
-    print(f"Subset size: {subset_size} samples")
-    print(f"Image tokens in subset: {(labels_subset == image_modality_id).sum().item()}")
+    print(f"Image positions (label=1): {(labels_filtered == 1).sum().item()}")
+    print(f"Non-image positions (label=0): {(labels_filtered == 0).sum().item()}")
     
     # Process autoencoder activations in chunks to avoid memory issues
     chunk_size = 10000
     autoencoder_acts_list = []
     
     print("\nProcessing activations through autoencoder...")
-    for start_idx in tqdm(range(0, len(activations_subset), chunk_size)):
-        end_idx = min(start_idx + chunk_size, len(activations_subset))
-        chunk = activations_subset[start_idx:end_idx].to(device)
+    for start_idx in tqdm(range(0, len(activations_filtered), chunk_size)):
+        end_idx = min(start_idx + chunk_size, len(activations_filtered))
+        chunk = activations_filtered[start_idx:end_idx].to(device)
         
         with torch.no_grad():
             try:
@@ -696,7 +934,6 @@ def plot_tsne_visualization(activations_tensor_flat, modality_labels_flat, autoe
                 torch.cuda.empty_cache()
             except Exception as e:
                 print(f"Error processing chunk {start_idx}-{end_idx}: {str(e)}")
-                import traceback
                 print(f"Traceback:\n{traceback.format_exc()}")
                 continue
     
@@ -746,7 +983,6 @@ def plot_tsne_visualization(activations_tensor_flat, modality_labels_flat, autoe
         
     except Exception as e:
         print(f"Error during TSNE: {str(e)}")
-        import traceback
         print(f"Traceback:\n{traceback.format_exc()}")
         return None, None
     
@@ -754,25 +990,29 @@ def plot_tsne_visualization(activations_tensor_flat, modality_labels_flat, autoe
     print("\nCreating visualization...")
     plt.figure(figsize=(12, 8))
     
-    # Plot all points
+    # Plot points with different colors for different positions
     print("Plotting points...")
-    plt.scatter(latents_2d[:, 0], latents_2d[:, 1], c='gray', alpha=0.1, s=1, label='Other modalities')
+    # Plot non-image positions in gray
+    non_image_mask = labels_filtered == 0
+    if non_image_mask.any():
+        plt.scatter(latents_2d[non_image_mask, 0], latents_2d[non_image_mask, 1], 
+                   c='gray', alpha=0.1, s=1, label='Non-image positions')
     
-    # Highlight image modality
-    print("Highlighting image modality...")
-    image_mask = labels_subset == image_modality_id
+    # Highlight image positions in red
+    print("Highlighting image positions...")
+    image_mask = labels_filtered == 1
     if image_mask.any():
         plt.scatter(latents_2d[image_mask, 0], latents_2d[image_mask, 1], 
-                   c='red', alpha=0.5, s=2, label='Image modality')
+                   c='red', alpha=0.5, s=2, label='Image positions')
     
-    plt.title('t-SNE Visualization of Autoencoder Activations (20% Subset)')
+    plt.title('t-SNE Visualization of Autoencoder Activations\n(Image vs Non-Image Positions)')
     plt.xlabel('t-SNE dimension 1')
     plt.ylabel('t-SNE dimension 2')
     plt.legend()
     
     # Save plot
     print("Saving plot...")
-    output_file = f'{output_prefix}_tsne_subset.png'
+    output_file = f'{output_prefix}_tsne.png'
     plt.savefig(output_file, dpi=300, bbox_inches='tight')
     plt.close()
     print(f"Saved visualization to {output_file}")
@@ -781,7 +1021,352 @@ def plot_tsne_visualization(activations_tensor_flat, modality_labels_flat, autoe
     print("Cleaning up...")
     torch.cuda.empty_cache()
     
-    return latents_2d, None
+    return latents_2d
+
+def plot_pca_visualization(activations_tensor_flat, modality_labels_flat, autoencoder, device, 
+                          image_modality_id, output_prefix, n_components, 
+                          standardize, random_state):
+    """
+    Create PCA visualization of activations with different colors for image vs non-image tokens.
+    Also analyze distances to check for radial structure.
+    
+    Args:
+        activations_tensor_flat: Flattened tensor of activations [n_samples, hidden_dim]
+        modality_labels_flat: Flattened tensor of modality labels [n_samples]
+        autoencoder: Trained sparse autoencoder model
+        device: Device to run computations on
+        image_modality_id: ID for image modality tokens
+        output_prefix: Prefix for output files
+        n_components: Number of PCA components (2 for visualization)
+        standardize: Whether to standardize features before PCA
+        random_state: Random seed for reproducibility
+    """
+    print("\nStarting PCA visualization...")
+    
+    # Move tensors to CPU to avoid CUDA memory issues
+    print("Moving tensors to CPU...")
+    activations_tensor_flat = activations_tensor_flat.cpu()
+    modality_labels_flat = modality_labels_flat.cpu()
+    
+    # Filter out padding tokens (-1)
+    print("Filtering padding tokens...")
+    valid_mask = modality_labels_flat != -1
+    activations_filtered = activations_tensor_flat[valid_mask]
+    labels_filtered = modality_labels_flat[valid_mask]
+    
+    print(f"Filtered activations shape: {activations_filtered.shape}")
+    print(f"Number of valid samples: {valid_mask.sum().item()}")
+    print(f"Image tokens: {(labels_filtered == image_modality_id).sum().item()}")
+    
+    # Process autoencoder activations in chunks to avoid memory issues
+    chunk_size = 10000
+    autoencoder_acts_list = []
+    
+    print("\nProcessing activations through autoencoder...")
+    for start_idx in tqdm(range(0, len(activations_filtered), chunk_size)):
+        end_idx = min(start_idx + chunk_size, len(activations_filtered))
+        chunk = activations_filtered[start_idx:end_idx].to(device)
+        
+        with torch.no_grad():
+            try:
+                _, encoded = autoencoder(chunk)
+                autoencoder_acts_list.append(encoded.cpu())
+                # Clear CUDA cache after each chunk
+                torch.cuda.empty_cache()
+            except Exception as e:
+                print(f"Error processing chunk {start_idx}-{end_idx}: {str(e)}")
+                print(f"Traceback:\n{traceback.format_exc()}")
+                continue
+    
+    # Concatenate all chunks
+    print("\nConcatenating autoencoder activations...")
+    autoencoder_acts = torch.cat(autoencoder_acts_list, dim=0)
+    print(f"Autoencoder activations shape: {autoencoder_acts.shape}")
+    
+    # Convert to numpy and free GPU memory
+    print("Converting to numpy array...")
+    autoencoder_acts_np = autoencoder_acts.numpy()
+    del autoencoder_acts
+    del autoencoder_acts_list
+    torch.cuda.empty_cache()
+    
+    # Standardize features if requested
+    if standardize:
+        print("Standardizing features...")
+        scaler = StandardScaler()
+        autoencoder_acts_np = scaler.fit_transform(autoencoder_acts_np)
+    
+    # Apply PCA
+    print(f"\nApplying PCA with {n_components} components...")
+    try:
+        pca = PCA(n_components=n_components, random_state=random_state)
+        latents_2d = pca.fit_transform(autoencoder_acts_np)
+        print("PCA completed successfully")
+        
+        # Print explained variance
+        explained_var = pca.explained_variance_ratio_
+        print(f"Explained variance ratio: {explained_var}")
+        print(f"Total explained variance: {explained_var.sum():.4f}")
+        
+        # Free memory
+        del autoencoder_acts_np
+        torch.cuda.empty_cache()
+        
+    except Exception as e:
+        print(f"Error during PCA: {str(e)}")
+        print(f"Traceback:\n{traceback.format_exc()}")
+        return None, None
+    
+    # Analyze distances to check for radial structure
+    print("\nAnalyzing distance patterns...")
+    image_mask = labels_filtered == image_modality_id
+    
+    # Calculate centroids
+    all_centroid = np.mean(latents_2d, axis=0)
+    gray_centroid = np.mean(latents_2d[~image_mask], axis=0)
+    red_centroid = np.mean(latents_2d[image_mask], axis=0)
+    
+    # Calculate distances from centroids
+    red_distances_from_all = np.linalg.norm(latents_2d[image_mask] - all_centroid, axis=1)
+    gray_distances_from_all = np.linalg.norm(latents_2d[~image_mask] - all_centroid, axis=1)
+    red_distances_from_gray = np.linalg.norm(latents_2d[image_mask] - gray_centroid, axis=1)
+    
+    # Print distance statistics
+    print(f"\nDistance Analysis:")
+    print(f"Red points distance from overall centroid: {red_distances_from_all.mean():.4f} ± {red_distances_from_all.std():.4f}")
+    print(f"Gray points distance from overall centroid: {gray_distances_from_all.mean():.4f} ± {gray_distances_from_all.std():.4f}")
+    print(f"Red points distance from gray centroid: {red_distances_from_gray.mean():.4f} ± {red_distances_from_gray.std():.4f}")
+    
+    # Check if red points form a shell around gray points
+    red_mean_dist = red_distances_from_gray.mean()
+    red_std_dist = red_distances_from_gray.std()
+    shell_coefficient = red_std_dist / red_mean_dist  # Lower values suggest more shell-like
+    print(f"Shell coefficient (std/mean of red distances from gray): {shell_coefficient:.4f}")
+    print(f"Lower values suggest more shell-like arrangement")
+    
+    # Create visualization
+    print("\nCreating PCA visualization...")
+    fig, ((ax1, ax2), (ax3, ax4)) = plt.subplots(2, 2, figsize=(15, 12))
+    
+    # Plot 1: Main PCA visualization
+    ax1.scatter(latents_2d[~image_mask, 0], latents_2d[~image_mask, 1], 
+               c='gray', alpha=0.1, s=1, label='Other modalities')
+    if image_mask.any():
+        ax1.scatter(latents_2d[image_mask, 0], latents_2d[image_mask, 1], 
+                   c='red', alpha=0.5, s=2, label='Image modality')
+    
+    ax1.scatter(*all_centroid, c='blue', s=100, marker='x', label='Overall centroid')
+    ax1.scatter(*gray_centroid, c='black', s=100, marker='+', label='Gray centroid')
+    ax1.scatter(*red_centroid, c='darkred', s=100, marker='*', label='Red centroid')
+    
+    ax1.set_title(f'PCA Visualization\n(Explained variance: {explained_var.sum():.3f})')
+    ax1.set_xlabel(f'PC1 ({explained_var[0]:.3f})')
+    ax1.set_ylabel(f'PC2 ({explained_var[1]:.3f})')
+    ax1.legend()
+    ax1.grid(True, alpha=0.3)
+    
+    # Plot 2: Distance distributions
+    ax2.hist(red_distances_from_gray, bins=50, alpha=0.7, label='Red from gray centroid', color='red')
+    ax2.hist(gray_distances_from_all, bins=50, alpha=0.7, label='Gray from overall centroid', color='gray')
+    ax2.set_xlabel('Distance')
+    ax2.set_ylabel('Count')
+    ax2.set_title('Distance Distributions')
+    ax2.legend()
+    ax2.grid(True, alpha=0.3)
+    
+    # Plot 3: Polar plot to check radial structure
+    if image_mask.any():
+        # Convert red points to polar coordinates relative to gray centroid
+        red_relative = latents_2d[image_mask] - gray_centroid
+        red_angles = np.arctan2(red_relative[:, 1], red_relative[:, 0])
+        red_radii = np.linalg.norm(red_relative, axis=1)
+        
+        ax3.scatter(red_angles, red_radii, c='red', alpha=0.5, s=2)
+        ax3.set_xlabel('Angle (radians)')
+        ax3.set_ylabel('Distance from gray centroid')
+        ax3.set_title('Red Points in Polar Coordinates\n(relative to gray centroid)')
+        ax3.grid(True, alpha=0.3)
+    
+    # Plot 4: First few principal components
+    if n_components >= 3:
+        pca_more = PCA(n_components=min(10, autoencoder_acts.shape[1]), random_state=random_state)
+        latents_more = pca_more.fit_transform(autoencoder_acts_np)
+        ax4.bar(range(min(10, len(pca_more.explained_variance_ratio_))), 
+               pca_more.explained_variance_ratio_[:min(10, len(pca_more.explained_variance_ratio_))])
+        ax4.set_xlabel('Principal Component')
+        ax4.set_ylabel('Explained Variance Ratio')
+        ax4.set_title('Explained Variance by Component')
+        ax4.grid(True, alpha=0.3)
+    else:
+        ax4.text(0.5, 0.5, 'Need more components\nfor this analysis', 
+                ha='center', va='center', transform=ax4.transAxes)
+        ax4.set_title('Component Analysis')
+    
+    plt.tight_layout()
+    
+    # Save plot
+    print("Saving plot...")
+    output_file = f'{output_prefix}_pca_analysis.png'
+    plt.savefig(output_file, dpi=300, bbox_inches='tight')
+    plt.close()
+    print(f"Saved PCA analysis to {output_file}")
+    
+    # Clean up
+    print("Cleaning up...")
+    torch.cuda.empty_cache()
+    
+    return latents_2d, {
+        'explained_variance_ratio': explained_var,
+        'red_distances_from_gray': red_distances_from_gray,
+        'gray_distances_from_all': gray_distances_from_all,
+        'shell_coefficient': shell_coefficient,
+        'centroids': {
+            'all': all_centroid,
+            'gray': gray_centroid,
+            'red': red_centroid
+        }
+    }
+
+def run_tsne_analysis(model, autoencoder, data_loader_train, device, args, image_modality_id, output_prefix, perplexity, n_iter, random_state):
+    print(f"Data loader created: {type(data_loader_train)}")
+    
+    # Try to get a single batch to test the data loader
+    print("\nTesting data loader with a single batch...")
+    try:
+        test_batch = next(iter(data_loader_train))
+        print("Successfully got first batch!")
+        print(f"Batch keys: {list(test_batch.keys())}")
+        for mod, d in test_batch.items():
+            print(f"Modality {mod} tensor shape: {d['tensor'].shape}")
+    except Exception as e:
+        print(f"Error getting first batch: {str(e)}")
+        print(f"Traceback:\n{traceback.format_exc()}")
+        raise
+    
+    print("\nStarting activation collection...")
+    try:
+        # Collect activations and modality labels
+        activations_tensor_flat, modality_labels_flat, examples_processed = collect_activations_batched(
+            model, data_loader_train, device, num_target_tokens=args.num_target_tokens
+        )
+        print("Finished collecting activations!")
+        
+        # Save activations immediately
+        print("\nSaving activations...")
+        save_path = f'/mnt/home/rzhang/ceph/activations_{examples_processed}examples.pt'
+        torch.save({
+            'activations': activations_tensor_flat,
+            'modality_labels': modality_labels_flat,
+            'examples_processed': examples_processed
+        }, save_path)
+        print(f"Saved activations to {save_path}")
+        
+        # Clear data loader and CUDA cache
+        del data_loader_train
+        torch.cuda.empty_cache()
+        
+        # Run TSNE visualization
+        print("\nStarting TSNE visualization...")
+        latents_2d = plot_tsne_visualization(
+            activations_tensor_flat,
+            modality_labels_flat,
+            autoencoder,
+            device,
+            image_modality_id=18665,
+            output_prefix='image_tsne',
+            perplexity=30,
+            n_iter=1000,
+            random_state=42
+        )
+        print("Finished TSNE visualization!")
+        
+    except Exception as e:
+        print(f"Error during processing: {str(e)}")
+        print(f"Traceback:\n{traceback.format_exc()}")
+    finally:
+        # Clean up
+        if 'data_loader_train' in locals():
+            del data_loader_train
+        torch.cuda.empty_cache()
+        print("\nCleanup completed")
+
+def run_pca_analysis(model, autoencoder, data_loader, device, args, 
+                    image_modality_id=18665, output_prefix='tok_image',
+                    n_components=2, standardize=True, random_state=42):
+    """
+    Run complete PCA analysis pipeline: collect activations, save them, and create visualization.
+    
+    Args:
+        model: AION model
+        autoencoder: Trained sparse autoencoder
+        data_loader: Data loader for collecting activations
+        device: Device to run computations on
+        args: Arguments object containing batch size and other parameters
+        image_modality_id: ID for image modality tokens
+        output_prefix: Prefix for output files
+        n_components: Number of PCA components
+        standardize: Whether to standardize features before PCA
+        random_state: Random seed for reproducibility
+    
+    Returns:
+        dict: Results including PCA latents, statistics, and examples processed
+    """
+    try:
+        print("\n=== Starting PCA Analysis Pipeline ===")
+        
+        # Collect activations
+        print("\nCollecting activations...")
+        activations_tensor_flat, modality_labels_flat, examples_processed = collect_activations_batched(
+            model, data_loader, device, num_target_tokens=args.num_target_tokens
+        )
+        print("Finished collecting activations!")
+        
+        # Save activations
+        print("\nSaving activations...")
+        save_path = f'/mnt/home/rzhang/ceph/activations_{examples_processed}examples.pt'
+        torch.save({
+            'activations': activations_tensor_flat,
+            'modality_labels': modality_labels_flat,
+            'examples_processed': examples_processed
+        }, save_path)
+        print(f"Saved activations to {save_path}")
+        
+        # Clear data loader and CUDA cache
+        del data_loader
+        torch.cuda.empty_cache()
+        
+        # Run PCA visualization
+        print("\nStarting PCA visualization...")
+        pca_latents, pca_stats = plot_pca_visualization(
+            activations_tensor_flat,
+            modality_labels_flat,
+            autoencoder,
+            device,
+            image_modality_id=image_modality_id,
+            output_prefix=output_prefix,
+            n_components=n_components,
+            standardize=standardize,
+            random_state=random_state
+        )
+        print("Finished PCA visualization!")
+        
+        return {
+            'pca_latents': pca_latents,
+            'pca_stats': pca_stats,
+            'examples_processed': examples_processed
+        }
+        
+    except Exception as e:
+        print(f"\nError during PCA analysis: {str(e)}")
+        print(f"Traceback:\n{traceback.format_exc()}")
+        return None
+        
+    finally:
+        # Clean up
+        if 'data_loader' in locals():
+            del data_loader
+        torch.cuda.empty_cache()
+        print("\nCleanup completed")
 
 if __name__ == '__main__':
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -869,99 +1454,68 @@ if __name__ == '__main__':
 
     # # Plot activation frequencies comparison
     # transformer_frequencies, autoencoder_frequencies = plot_activation_frequencies_comparison(activations_tensor_flat, autoencoder, device)
-
-    # Collect activations and modality labels
+    
+    # Collect activations and modality labels for transformer probing
+    print("\n=== Collecting activations for transformer neuron probing ===")
     activations_tensor_flat, modality_labels_flat, examples_processed = collect_activations_batched(
         model, data_loader_train, device, num_target_tokens=args.num_target_tokens
     )
-    # Apply the logistic probe on each latent dimension  
-    apply_logistic_probe(
+    
+    # Apply the dense probe on ALL transformer neurons simultaneously  
+    apply_dense_probe_transformer(
         activations_tensor_flat, 
         modality_labels_flat, 
-        examples_processed, 
-        autoencoder, 
-        device,
-        image_modality_id=18665,  # ID for tok_image
-        output_prefix='tok_image',  # Prefix for output files
+        examples_processed,
+        image_modality_id=18665,  # This parameter is now unused but kept for compatibility
+        output_prefix='image_transformer_dense',  # Updated prefix
         test_size=0.2,
         random_state=42
     )
-    
-    # print(f"Data loader created: {type(data_loader_train)}")
-    
-    # # Try to get a single batch to test the data loader
-    # print("\nTesting data loader with a single batch...")
-    # try:
-    #     test_batch = next(iter(data_loader_train))
-    #     print("Successfully got first batch!")
-    #     print(f"Batch keys: {list(test_batch.keys())}")
-    #     for mod, d in test_batch.items():
-    #         print(f"Modality {mod} tensor shape: {d['tensor'].shape}")
-    # except Exception as e:
-    #     print(f"Error getting first batch: {str(e)}")
-    #     import traceback
-    #     print(f"Traceback:\n{traceback.format_exc()}")
-    #     raise
-    
-    # print("\nStarting activation collection...")
-    # try:
-    #     # Collect activations and modality labels
-    #     activations_tensor_flat, modality_labels_flat, examples_processed = collect_activations_batched(
-    #         model, data_loader_train, device, num_target_tokens=args.num_target_tokens
-    #     )
-    #     print("Finished collecting activations!")
-        
-    #     # Save activations immediately
-    #     print("\nSaving activations...")
-    #     save_path = f'/mnt/home/rzhang/ceph/activations_{examples_processed}examples.pt'
-    #     torch.save({
-    #         'activations': activations_tensor_flat,
-    #         'modality_labels': modality_labels_flat,
-    #         'examples_processed': examples_processed
-    #     }, save_path)
-    #     print(f"Saved activations to {save_path}")
-        
-    #     # Clear data loader and CUDA cache
-    #     del data_loader_train
-    #     torch.cuda.empty_cache()
-        
-    #     # Run TSNE visualization
-    #     print("\nStarting TSNE visualization...")
-    #     latents_2d, latents_2d_alt = plot_tsne_visualization(
-    #         activations_tensor_flat,
-    #         modality_labels_flat,
-    #         autoencoder,
-    #         device,
-    #         image_modality_id=18665,
-    #         output_prefix='tok_image',
-    #         perplexity=30,
-    #         n_iter=1000,
-    #         random_state=42
-    #     )
-    #     print("Finished TSNE visualization!")
-        
-    # except Exception as e:
-    #     print(f"Error during processing: {str(e)}")
-    #     import traceback
-    #     print(f"Traceback:\n{traceback.format_exc()}")
-    # finally:
-    #     # Clean up
-    #     if 'data_loader_train' in locals():
-    #         del data_loader_train
-    #     torch.cuda.empty_cache()
-    #     print("\nCleanup completed")
 
-    # # After collecting activations, add TSNE visualization
-    # latents_2d, latents_2d_alt = plot_tsne_visualization(
-    #     activations_tensor_flat,
-    #     modality_labels_flat,
-    #     autoencoder,
+    # # Collect activations and modality labels
+    # activations_tensor_flat, modality_labels_flat, examples_processed = collect_activations_batched(
+    #     model, data_loader_train, device, num_target_tokens=args.num_target_tokens
+    # )
+    # # Apply the logistic probe on each latent dimension  
+    # apply_logistic_probe(
+    #     activations_tensor_flat, 
+    #     modality_labels_flat, 
+    #     examples_processed, 
+    #     autoencoder, 
     #     device,
+    #     image_modality_id=18665,  # ID for tok_image
+    #     output_prefix='tok_image',  # Prefix for output files
+    #     test_size=0.2,
+    #     random_state=42
+    # )
+
+    # # Run PCA analysis
+    # run_pca_analysis(
+    #     model,
+    #     autoencoder,
+    #     data_loader_train,
+    #     device,
+    #     args,
     #     image_modality_id=18665,
     #     output_prefix='tok_image',
-    #     perplexity=30,
-    #     n_iter=1000,
+    #     n_components=2,
+    #     standardize=True,
     #     random_state=42
     # )
     
+    # # Run TSNE analysis
+    # run_tsne_analysis(
+    #     model=model,
+    #     autoencoder=autoencoder,
+    #     data_loader_train=data_loader_train,
+    #     device=device,
+    #     args=args,
+    #     image_modality_id=18665,
+    #     output_prefix='tok_image',
+    #     perplexity=30,
+    #     n_iter=500,
+    #     random_state=42
+    # )
+
+
 
