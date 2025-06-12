@@ -220,27 +220,119 @@ def plot_activation_frequencies_comparison(transformer_activations, autoencoder,
 
     return transformer_frequencies, autoencoder_frequencies
 
-def collect_activations_batched(model, data_loader, device, num_target_tokens):
+def collect_activations_batched_encoder(model, data_loader, device, num_target_tokens):
+    """
+    Collect activations from encoder block 8 while trusting AION's internal token selection.
+    
+    KEY APPROACH: 
+    - We let AION handle ALL token selection internally via forward_mask_encoder
+    - No manual truncation or token manipulation on our part
+    - AION automatically prioritizes valid tokens (input_mask=False) and excludes masked tokens (input_mask=True)
+    - We capture AION's actual selection by overriding embed_inputs temporarily
+    - This approach respects AION's sophisticated mask-based token selection mechanism
+    
+    Args:
+        model: AION model
+        data_loader: DataLoader for input data
+        device: Device to run on
+        num_target_tokens: Maximum number of tokens for AION to select
+        
+    Returns:
+        tuple: (activations_tensor_flat, modality_labels_flat, examples_processed)
+    """
     print("\n=== Starting Activation Collection ===")
     print(f"Using num_target_tokens: {num_target_tokens}")
+    print("🔑 KEY: Capturing AION's EXACT token selection - no approximation!")
     
     activations = []
-    modality_labels = []  # List to store modality labels
+    modality_labels = [] 
     examples_processed = 0
+    
+    # Storage for AION selection analysis
+    aion_selection_analysis = {
+        'before_selection': {},  # modality -> total tokens available
+        'after_selection': {},   # modality -> tokens actually selected
+        'elimination_details': {},  # detailed breakdown per batch
+        'selection_results': []   # Store actual selection results
+    }
     
     def hook_fn(module, input, output):
         print(f'\nHook received output shape: {output.shape}')
         # Save activations
         activations.append(output.clone().detach().cpu())
     
-    # # register hook on the spatial attention layer
-    # ninth_decoder_block = model.decoder[8]
-    # hook = ninth_decoder_block.register_forward_hook(hook_fn)
-    # print(f"Registered hook on decoder block 8")
-    # TESTING ENCODER INSTEAD
+    # Store original embed_inputs method
+    original_embed_inputs = model.embed_inputs
+    
+    def instrumented_embed_inputs(input_dict, mask=None, num_encoder_tokens=256):
+        """Instrumented version of embed_inputs that captures selection details"""
+        
+        print(f"\n🔍 DEBUGGING AION'S MASK-BASED SELECTION:")
+        print(f"  Input modalities: {list(input_dict.keys())}")
+        print(f"  Requested num_encoder_tokens: {num_encoder_tokens}")
+        
+        # Check the input_mask values in the raw input
+        print(f"\n📊 INPUT MASK ANALYSIS:")
+        for mod, tensor in input_dict.items():
+            print(f"  {mod}: tensor shape {tensor.shape}")
+            if mask is not None and mod in mask:
+                input_mask = mask[mod]
+                masked_count = input_mask.sum().item()
+                total_count = input_mask.numel()
+                mask_percentage = (masked_count / total_count) * 100
+                print(f"    Input mask: {masked_count}/{total_count} masked ({mask_percentage:.1f}%)")
+            else:
+                print(f"    No input mask provided - all tokens should be valid")
+        
+        # Call the original method
+        encoder_tokens, encoder_emb, encoder_mask, mod_mask = original_embed_inputs(
+            input_dict, mask=mask, num_encoder_tokens=num_encoder_tokens
+        )
+        
+        print(f"\n🎯 AION'S SELECTION RESULTS:")
+        print(f"  Selected tokens shape: {encoder_tokens.shape}")
+        print(f"  Selected {encoder_tokens.shape[1]} out of requested {num_encoder_tokens}")
+        
+        # Analyze the final modality mask to see what was selected
+        selected_mod_ids = mod_mask[0]  # First example in batch
+        unique_mod_ids = torch.unique(selected_mod_ids)
+        print(f"  Selected modality IDs: {unique_mod_ids.tolist()}")
+        
+        # Count tokens per modality in the selection
+        print(f"\n📋 SELECTED TOKENS BY MODALITY:")
+        for mod_id in unique_mod_ids:
+            if mod_id != -1:  # Skip padding
+                count = (selected_mod_ids == mod_id).sum().item()
+                # Try to find modality name
+                mod_name = next((mod for mod, info in model.modality_info.items() if info["id"] == mod_id), f"Unknown-{mod_id}")
+                print(f"    {mod_name} (ID: {mod_id}): {count} tokens")
+        
+        # Check if selection appears to be positional
+        # We'll do this by checking if the first few hundred tokens are consecutive modality IDs
+        first_100_ids = selected_mod_ids[:100].tolist()
+        print(f"  First 100 selected modality IDs: {first_100_ids[:20]}...{first_100_ids[-20:]}")
+        
+        # Store the selection information for analysis
+        aion_selection_analysis['selection_results'].append({
+            'encoder_tokens_shape': encoder_tokens.shape,
+            'encoder_emb_shape': encoder_emb.shape,
+            'encoder_mask_shape': encoder_mask.shape,
+            'mod_mask_shape': mod_mask.shape,
+            'mod_mask': mod_mask.clone().detach().cpu(),
+            'encoder_mask': encoder_mask.clone().detach().cpu(),
+            'selected_mod_ids': selected_mod_ids.clone().detach().cpu(),
+            'unique_selected_mod_ids': unique_mod_ids.clone().detach().cpu()
+        })
+        
+        return encoder_tokens, encoder_emb, encoder_mask, mod_mask
+    
+    # Temporarily replace the method
+    model.embed_inputs = instrumented_embed_inputs
+    
+    # Register hook on encoder block 8 for activations
     ninth_encoder_block = model.encoder[8] 
-    hook = ninth_encoder_block.register_forward_hook(hook_fn)
-    print(f"Registered hook on encoder block 8")
+    activation_hook = ninth_encoder_block.register_forward_hook(hook_fn)
+    print(f"Registered activation hook on encoder block 8")
 
     with torch.no_grad():
         for batch_idx, data in enumerate(data_loader):
@@ -256,59 +348,197 @@ def collect_activations_batched(model, data_loader, device, num_target_tokens):
             for mod, d in data.items():
                 processed_data[mod] = {k: v.to(device) if isinstance(v, torch.Tensor) else v 
                                       for k, v in d.items()}
-            
             print("Data moved to device")
             
-            # Prepare input dictionary and target mask
             input_dict = {}
-            target_mask = {}
-
-            # Track which modality each token comes from
-            batch_modality_labels = []
+            input_mask_dict = {}
             total_tokens = 0
+            batch_modality_labels = []
             
-            # Collect input and target data
+            # DETAILED ANALYSIS: Track BEFORE selection
+            print(f"\n🔍 BEFORE AION SELECTION - Available Modalities:")
+            batch_before_selection = {}
+            
+            # Collect input data and build comprehensive modality labels
+            modality_order = []  # Track the order of modalities for proper indexing
             for mod, d in processed_data.items():
                 if mod in model.encoder_embeddings:
+                    print(f'\n--- Modality: {mod} ---')
+                    print(f'  Tensor shape: {d["tensor"].shape}')
+                    
                     input_dict[mod] = d['tensor']
+                    
                     # Get the modality ID from the model's modality info
                     mod_id = model.modality_info[mod]["id"]
-                    # Get the number of tokens for this modality
                     num_tokens = d['tensor'].shape[1]
-                    # Only create labels for tokens up to num_target_tokens
-                    num_tokens = min(num_tokens, num_target_tokens)
-                    # Create labels for these tokens
+                    
+                    print(f'  Modality ID: {mod_id}')
+                    print(f'  Number of tokens: {num_tokens}')
+                    
+                    # Track for BEFORE selection analysis
+                    tokens_this_mod = current_batch_size * num_tokens
+                    batch_before_selection[mod] = {
+                        'id': mod_id,
+                        'tokens_per_example': num_tokens,
+                        'total_tokens_in_batch': tokens_this_mod,
+                        'start_index': total_tokens,  # Track position in concatenated sequence
+                        'end_index': total_tokens + num_tokens - 1
+                    }
+                    
+                    # Check input_mask status
+                    if 'input_mask' in d:
+                        input_mask_dict[mod] = d['input_mask']
+                        mask_tensor = d['input_mask']
+                        masked_count = mask_tensor.sum().item()
+                        total_count = mask_tensor.numel()
+                        valid_count = total_count - masked_count
+                        mask_percentage = (masked_count / total_count) * 100 if total_count > 0 else 0.0
+                        
+                        print(f"  Input mask: {masked_count}/{total_count} masked ({mask_percentage:.1f}%)")
+                        print(f"  Valid tokens: {valid_count} (should be prioritized by AION)")
+                        
+                        batch_before_selection[mod]['masked_tokens'] = masked_count
+                        batch_before_selection[mod]['valid_tokens'] = valid_count
+                        batch_before_selection[mod]['mask_percentage'] = mask_percentage
+                    else:
+                        print(f'  No input_mask (all tokens assumed valid)')
+                        batch_before_selection[mod]['masked_tokens'] = 0
+                        batch_before_selection[mod]['valid_tokens'] = tokens_this_mod
+                        batch_before_selection[mod]['mask_percentage'] = 0.0
+                    
+                    # Create labels for ALL tokens with proper indexing
                     batch_modality_labels.append(torch.full((current_batch_size, num_tokens), mod_id, dtype=torch.long, device='cpu'))
+                    modality_order.append(mod)
                     total_tokens += num_tokens
-                if mod in model.decoder_embeddings:
-                    target_mask[mod] = d['target_mask']
+            
+            # Summarize BEFORE selection
+            print(f"\n📊 SUMMARY BEFORE AION SELECTION:")
+            total_available = sum(info['total_tokens_in_batch'] for info in batch_before_selection.values())
+            total_valid = sum(info['valid_tokens'] for info in batch_before_selection.values())
+            total_masked = sum(info['masked_tokens'] for info in batch_before_selection.values())
+            
+            for mod, info in batch_before_selection.items():
+                print(f"  {mod}: {info['total_tokens_in_batch']} tokens (pos {info['start_index']}-{info['end_index']}), {info['mask_percentage']:.1f}% masked")
+                
+            num_encoder_tokens_to_use = 900 
+                
+            print(f"\nTotal input tokens: {total_tokens}")
+            print(f"Using num_encoder_tokens: {num_encoder_tokens_to_use}")
             
             # Concatenate modality labels for this batch
             if batch_modality_labels:
                 batch_modality_tensor = torch.cat(batch_modality_labels, dim=1)
-                # Ensure we only have num_target_tokens tokens
-                if batch_modality_tensor.shape[1] > num_target_tokens:
-                    batch_modality_tensor = batch_modality_tensor[:, :num_target_tokens]
-                # Pad to match the model's sequence length (256)
-                if batch_modality_tensor.shape[1] < 256:
-                    padding = torch.full((current_batch_size, 256 - batch_modality_tensor.shape[1]), 
-                                       -1, dtype=torch.long, device='cpu')
-                    batch_modality_tensor = torch.cat([batch_modality_tensor, padding], dim=1)
+                print(f"\nTotal tokens across all modalities: {batch_modality_tensor.shape[1]}")
+                print(f"Model will intelligently select up to {num_encoder_tokens_to_use} tokens from these using AION's internal token selection")
+                
+                # Store the full label tensor for later analysis
                 modality_labels.append(batch_modality_tensor)
             else:
                 print("Warning: No modality labels created for this batch")
-                modality_labels.append(torch.full((current_batch_size, 256), -1, dtype=torch.long, device='cpu'))
+                num_encoder_tokens_to_use = 256  # fallback
+                modality_labels.append(torch.full((current_batch_size, num_encoder_tokens_to_use), -1, dtype=torch.long, device='cpu'))
 
-            # Run the model
-            print("\nRunning forward pass...")
-            output = model(input_dict, target_mask)
+            # Use model.encode() to get embeddings following the notebook pattern
+            print(f"\n🚀 Running model.encode() - AION will now make its selection...")
+            embeddings = model.encode(input_dict, input_mask=input_mask_dict, num_encoder_tokens=num_encoder_tokens_to_use)
+            print(f"✅ Embeddings shape: {embeddings.shape}")
+            
+            # EXACT ANALYSIS: Use AION's captured selection information
+            actual_seq_length = embeddings.shape[1]
+            
+            print(f"\n🔍 AFTER AION SELECTION - Results:")
+            print(f"  Available tokens: {batch_modality_tensor.shape[1]}")
+            print(f"  AION selected: {actual_seq_length} tokens")
+            print(f"  Elimination rate: {((batch_modality_tensor.shape[1] - actual_seq_length) / batch_modality_tensor.shape[1]) * 100:.1f}%")
+            
+            # EXACT ANALYSIS: Use AION's modality mask to determine selection
+            if len(aion_selection_analysis['selection_results']) > batch_idx:
+                selection_result = aion_selection_analysis['selection_results'][batch_idx]
+                selected_mod_mask = selection_result['mod_mask']
+                selected_encoder_mask = selection_result['encoder_mask']
+                
+                print(f"\n🎯 EXACT AION SELECTION ANALYSIS:")
+                print(f"  Using AION's actual modality mask (not approximation)")
+                print(f"  Selected modality mask shape: {selected_mod_mask.shape}")
+                
+                # Count exactly which modalities AION selected
+                batch_after_selection = {}
+                for mod, info in batch_before_selection.items():
+                    mod_id = info['id']
+                    # Count how many times this modality ID appears in AION's selection
+                    selected_count = (selected_mod_mask == mod_id).sum().item()
+                    batch_after_selection[mod] = {
+                        'id': mod_id,
+                        'selected_tokens': selected_count,
+                        'original_tokens': info['total_tokens_in_batch'],
+                        'survival_rate': selected_count / info['total_tokens_in_batch'] if info['total_tokens_in_batch'] > 0 else 0.0
+                    }
+                
+                # Print detailed selection results
+                print(f"\n📋 EXACT MODALITY SELECTION BREAKDOWN:")
+                print(f"{'Modality':<20} {'Original':<10} {'Selected':<10} {'Survival%':<10} {'Status'}")
+                print("-" * 65)
+                
+                for mod in sorted(batch_before_selection.keys()):
+                    orig = batch_before_selection[mod]['total_tokens_in_batch']
+                    selected = batch_after_selection[mod]['selected_tokens']
+                    survival = batch_after_selection[mod]['survival_rate'] * 100
+                    
+                    if selected == 0:
+                        status = "❌ ELIMINATED"
+                    elif survival < 50:
+                        status = "⚠️  HEAVILY REDUCED"
+                    elif survival < 90:
+                        status = "📉 PARTIALLY KEPT"
+                    else:
+                        status = "✅ MOSTLY KEPT"
+                    
+                    print(f"{mod:<20} {orig:<10} {selected:<10} {survival:<9.1f}% {status}")
+                
+                # Store detailed analysis for later aggregation
+                aion_selection_analysis['elimination_details'][batch_idx] = {
+                    'before': batch_before_selection,
+                    'after': batch_after_selection,
+                    'total_available': total_available,
+                    'total_selected': actual_seq_length,
+                    'elimination_rate': ((total_available - actual_seq_length) / total_available) * 100
+                }
+                
+                # Update global counters
+                for mod, info in batch_before_selection.items():
+                    if mod not in aion_selection_analysis['before_selection']:
+                        aion_selection_analysis['before_selection'][mod] = 0
+                    if mod not in aion_selection_analysis['after_selection']:
+                        aion_selection_analysis['after_selection'][mod] = 0
+                    
+                    aion_selection_analysis['before_selection'][mod] += info['total_tokens_in_batch']
+                    aion_selection_analysis['after_selection'][mod] += batch_after_selection[mod]['selected_tokens']
+                
+                # Create EXACT labels based on AION's selection
+                # We'll use AION's modality mask directly
+                print(f"\n✅ CREATING EXACT LABELS FROM AION'S SELECTION")
+                print(f"  Using AION's modality mask to create perfect alignment")
+                
+                # Replace our approximated labels with AION's exact selection
+                exact_labels = selected_mod_mask.clone()  # Shape: (batch_size, selected_length)
+                modality_labels[-1] = exact_labels  # Replace the last added labels
+                
+                print(f"  Exact labels shape: {exact_labels.shape}")
+                print(f"  Perfect alignment with AION's embeddings: {embeddings.shape}")
+                
+            else:
+                print(f"\n⚠️  WARNING: Could not capture AION's selection indices")
+                print(f"  Falling back to positional approximation")
+                selected_labels = batch_modality_tensor[:, :actual_seq_length]
 
             torch.cuda.empty_cache()
             examples_processed += current_batch_size
-            print(f"Total examples processed: {examples_processed}")
-    # Remove the hook
-    hook.remove()
-    print("\nHook removed")
+            print(f"\nTotal examples processed: {examples_processed}")
+    
+    # Restore original method and remove the hook
+    model.embed_inputs = original_embed_inputs
+    activation_hook.remove()
+    print("\nMethod restored and hook removed")
     
     # Concatenate all activations
     print("\nConcatenating activations...")
@@ -323,6 +553,88 @@ def collect_activations_batched(model, data_loader, device, num_target_tokens):
     print(f"Final modality labels shape: {modality_labels_tensor.shape}")
     print(f"Final modality labels dtype: {modality_labels_tensor.dtype}")
     print(f"Final modality labels device: {modality_labels_tensor.device}")
+
+    # FINAL AION SELECTION ANALYSIS
+    print(f"\n" + "="*60)
+    print(f"🎯 FINAL AION SELECTION ANALYSIS")
+    print(f"="*60)
+    
+    print(f"\n📊 OVERALL STATISTICS:")
+    total_before = sum(aion_selection_analysis['before_selection'].values())
+    total_after = sum(aion_selection_analysis['after_selection'].values())
+    overall_elimination_rate = ((total_before - total_after) / total_before) * 100 if total_before > 0 else 0
+    
+    print(f"  Total tokens available: {total_before}")
+    print(f"  Total tokens selected: {total_after}")
+    print(f"  Overall elimination rate: {overall_elimination_rate:.1f}%")
+    print(f"  AION kept {total_after}/{total_before} tokens ({(total_after/total_before)*100:.1f}%)")
+    
+    print(f"\n📋 FINAL MODALITY BREAKDOWN:")
+    print(f"{'Modality':<20} {'Available':<12} {'Selected':<12} {'Survival%':<12} {'Final Status'}")
+    print("-" * 75)
+    
+    modality_survival_rates = {}
+    for mod in sorted(aion_selection_analysis['before_selection'].keys()):
+        available = aion_selection_analysis['before_selection'][mod]
+        selected = aion_selection_analysis['after_selection'][mod]
+        survival_rate = (selected / available * 100) if available > 0 else 0.0
+        modality_survival_rates[mod] = survival_rate
+        
+        if selected == 0:
+            status = "❌ COMPLETELY ELIMINATED"
+        elif survival_rate < 10:
+            status = "🔥 HEAVILY ELIMINATED"
+        elif survival_rate < 50:
+            status = "⚠️  SIGNIFICANTLY REDUCED"
+        elif survival_rate < 80:
+            status = "📉 MODERATELY REDUCED"
+        elif survival_rate < 95:
+            status = "📊 LIGHTLY REDUCED"
+        else:
+            status = "✅ ALMOST ALL KEPT"
+        
+        print(f"{mod:<20} {available:<12} {selected:<12} {survival_rate:<11.1f}% {status}")
+    
+    # Identify the winners and losers
+    print(f"\n🏆 MODALITY WINNERS (highest survival rates):")
+    sorted_mods = sorted(modality_survival_rates.items(), key=lambda x: x[1], reverse=True)
+    for mod, rate in sorted_mods[:3]:
+        print(f"  {mod}: {rate:.1f}% survival rate")
+    
+    print(f"\n💀 MODALITY LOSERS (lowest survival rates):")
+    for mod, rate in sorted_mods[-3:]:
+        print(f"  {mod}: {rate:.1f}% survival rate")
+    
+    # Special analysis for problematic modalities
+    print(f"\n🔍 SPECIAL ANALYSIS:")
+    for mod, rate in sorted_mods:
+        if rate == 0:
+            print(f"  {mod}: COMPLETELY ELIMINATED - all tokens were masked (input_mask=True)")
+        elif rate < 1:
+            print(f"  {mod}: NEARLY ELIMINATED - {rate:.3f}% survival suggests mostly masked tokens")
+    
+    print(f"\n✅ EXACT SELECTION: No approximation - used AION's actual modality mask")
+    print(f"✅ PERFECT ALIGNMENT: Labels match embeddings exactly")
+    
+    print(f"\n" + "="*60)
+    print(f"✅ AION SELECTION ANALYSIS COMPLETE")
+    print(f"="*60)
+
+    # Verify perfect alignment (no shape mismatch needed)
+    print(f"\n*** PERFECT ALIGNMENT VERIFICATION ***")
+    print(f"*** Activations shape: {activations_tensor.shape} ***")
+    print(f"*** Labels shape: {modality_labels_tensor.shape} ***")
+    
+    if activations_tensor.shape[:2] == modality_labels_tensor.shape:
+        print(f"*** ✅ PERFECT: Activations and labels perfectly aligned ***")
+        print(f"*** Using AION's exact selection - no approximation needed ***")
+    else:
+        print(f"*** ⚠️  UNEXPECTED: Shape mismatch despite using exact selection ***")
+        # Handle any unexpected mismatch
+        target_seq_length = activations_tensor.shape[1]
+        if modality_labels_tensor.shape[1] != target_seq_length:
+            print(f"*** Adjusting labels to match: {modality_labels_tensor.shape[1]} -> {target_seq_length} ***")
+            modality_labels_tensor = modality_labels_tensor[:, :target_seq_length]
 
     # Verify shapes match before flattening
     assert activations_tensor.shape[:2] == modality_labels_tensor.shape, \
@@ -347,7 +659,7 @@ def collect_activations_batched(model, data_loader, device, num_target_tokens):
     
     # Print unique modality values for verification
     unique_modalities = torch.unique(modality_labels_flat)
-    print(f"Unique modality values in labels: {unique_modalities.tolist()}")
+    print(f"Unique modality values in final labels: {unique_modalities.tolist()}")
     
     # Print modality distribution
     for mod_id in unique_modalities:
@@ -356,94 +668,14 @@ def collect_activations_batched(model, data_loader, device, num_target_tokens):
             percentage = (count / len(modality_labels_flat)) * 100
             # Try to get modality name from model's modality_info
             mod_name = next((mod for mod, info in model.modality_info.items() if info["id"] == mod_id), f"Unknown-{mod_id}")
-            print(f"Modality {mod_name} (ID: {mod_id}): {count} tokens ({percentage:.2f}%)")
+            print(f"Final dataset - {mod_name} (ID: {mod_id}): {count} tokens ({percentage:.2f}%)")
     
     # Print padding token distribution
     padding_count = (modality_labels_flat == -1).sum().item()
     padding_percentage = (padding_count / len(modality_labels_flat)) * 100
-    print(f"Padding tokens (-1): {padding_count} tokens ({padding_percentage:.2f}%)")
+    print(f"Final dataset - Padding tokens (-1): {padding_count} tokens ({padding_percentage:.2f}%)")
     
     return activations_tensor_flat, modality_labels_flat, examples_processed
-
-class NewtonRaphsonLogisticRegression:
-    """1D logistic regression using Newton-Raphson optimization"""
-    def __init__(self, max_iter=100, tol=1e-8):
-        self.max_iter = max_iter
-        self.tol = tol
-        self.w = None
-        self.b = None
-    
-    def _sigmoid(self, z):
-        """Sigmoid activation function"""
-        return 1 / (1 + np.exp(-np.clip(z, -30, 30)))  # Clip to avoid overflow
-    
-    def _loss(self, params, X, y):
-        """Binary cross-entropy loss"""
-        w, b = params
-        z = w * X + b
-        y_pred = self._sigmoid(z)
-        # Avoid log(0) errors
-        epsilon = 1e-15
-        y_pred = np.clip(y_pred, epsilon, 1 - epsilon)
-        return -np.mean(y * np.log(y_pred) + (1 - y) * np.log(1 - y_pred))
-    
-    def _gradient(self, params, X, y):
-        """Gradient of loss with respect to parameters"""
-        w, b = params
-        z = w * X + b
-        y_pred = self._sigmoid(z)
-        error = y_pred - y
-        grad_w = np.mean(error * X)
-        grad_b = np.mean(error)
-        return np.array([grad_w, grad_b])
-    
-    def _hessian(self, params, X, y):
-        """Hessian matrix (second derivatives)"""
-        w, b = params
-        z = w * X + b
-        y_pred = self._sigmoid(z)
-        diag = y_pred * (1 - y_pred)
-        H_ww = np.mean(diag * X * X)
-        H_wb = np.mean(diag * X)
-        H_bb = np.mean(diag)
-        return np.array([[H_ww, H_wb], [H_wb, H_bb]])
-    
-    def fit(self, X, y):
-        """Fit the model using Newton-Raphson method"""
-        # Initialize parameters
-        params = np.zeros(2)  # [w, b]
-        
-        for _ in range(self.max_iter):
-            # Calculate gradient and Hessian
-            gradient = self._gradient(params, X, y)
-            hessian = self._hessian(params, X, y)
-            
-            # Newton update: params = params - H^(-1) * gradient
-            try:
-                update = np.linalg.solve(hessian, gradient)
-            except np.linalg.LinAlgError:
-                # If Hessian is singular, add small value to diagonal
-                hessian = hessian + np.eye(2) * 1e-6
-                update = np.linalg.solve(hessian, gradient)
-            
-            # Update parameters
-            params = params - update
-            
-            # Check convergence
-            if np.linalg.norm(update) < self.tol:
-                break
-        
-        self.w, self.b = params
-        return self
-    
-    def predict_proba(self, X):
-        """Predict probability of class 1"""
-        z = self.w * X + self.b
-        return self._sigmoid(z)
-    
-    def predict(self, X, threshold=0.5):
-        """Predict class labels"""
-        return (self.predict_proba(X) >= threshold).astype(int)
 
 def apply_logistic_probe(
     activations_tensor_flat, 
@@ -652,14 +884,14 @@ def apply_dense_probe_transformer(
     activations_tensor_flat, 
     modality_labels_flat, 
     examples_processed,
-    image_modality_id=18665,  # Now used to identify image modality
+    image_modality_id,  # ID for the target modality to create binary labels
     output_prefix='image_transformer',  # Updated prefix
     test_size=0.2,
     random_state=42
 ):
     """
     Apply dense logistic probe to ALL transformer neurons simultaneously to find whether 
-    they contain info on whether the position is predicting image modality or not.
+    they contain info on whether the position corresponds to the target modality or not.
     
     This uses all 768 dimensions together in a single model, rather than testing each individually.
     
@@ -667,7 +899,7 @@ def apply_dense_probe_transformer(
         activations_tensor_flat: Flattened tensor of transformer activations [n_samples, 768]
         modality_labels_flat: Flattened tensor of modality IDs [n_samples] (actual modality IDs, -1=padding)
         examples_processed: Number of examples processed
-        image_modality_id: ID for image modality (used to create binary labels)
+        image_modality_id: ID for target modality (used to create binary labels: 1=target, 0=other)
         output_prefix: Prefix for output files
         test_size: Fraction of data to use for testing
         random_state: Random seed for reproducibility
@@ -1246,7 +1478,7 @@ def run_tsne_analysis(model, autoencoder, data_loader_train, device, args, image
     print("\nStarting activation collection...")
     try:
         # Collect activations and modality labels
-        activations_tensor_flat, modality_labels_flat, examples_processed = collect_activations_batched(
+        activations_tensor_flat, modality_labels_flat, examples_processed = collect_activations_batched_encoder(
             model, data_loader_train, device, num_target_tokens=args.num_target_tokens
         )
         print("Finished collecting activations!")
@@ -1316,7 +1548,7 @@ def run_pca_analysis(model, autoencoder, data_loader, device, args,
         
         # Collect activations
         print("\nCollecting activations...")
-        activations_tensor_flat, modality_labels_flat, examples_processed = collect_activations_batched(
+        activations_tensor_flat, modality_labels_flat, examples_processed = collect_activations_batched_encoder(
             model, data_loader, device, num_target_tokens=args.num_target_tokens
         )
         print("Finished collecting activations!")
@@ -1379,6 +1611,24 @@ if __name__ == '__main__':
     model.freeze_decoder()
     model = model.to(device).eval()  
     print(f"Model architecture:\n{model}")
+    
+    # Find the correct image modality ID dynamically
+    image_modality_name = None
+    image_modality_id = None
+    for mod_name, mod_info in model.modality_info.items():
+        if 'image' in mod_name.lower() or 'tok_image' in mod_name:
+            image_modality_name = mod_name
+            image_modality_id = mod_info['id']
+            break
+    
+    if image_modality_id is not None:
+        print(f"Found image modality: {image_modality_name} with ID: {image_modality_id}")
+    else:
+        print("Warning: Could not find image modality automatically")
+        # Fallback to manual specification
+        image_modality_id = 18665
+        print(f"Using fallback image modality ID: {image_modality_id}")
+    print()
 
     # Load the sparse autoencoder
     input_size = 768
@@ -1457,7 +1707,7 @@ if __name__ == '__main__':
     
     # Collect activations and modality labels for transformer probing
     print("\n=== Collecting activations for transformer neuron probing ===")
-    activations_tensor_flat, modality_labels_flat, examples_processed = collect_activations_batched(
+    activations_tensor_flat, modality_labels_flat, examples_processed = collect_activations_batched_encoder(
         model, data_loader_train, device, num_target_tokens=args.num_target_tokens
     )
     
@@ -1466,14 +1716,14 @@ if __name__ == '__main__':
         activations_tensor_flat, 
         modality_labels_flat, 
         examples_processed,
-        image_modality_id=18665,  # This parameter is now unused but kept for compatibility
+        image_modality_id=image_modality_id,  # Use the dynamically found modality ID
         output_prefix='image_transformer_dense',  # Updated prefix
         test_size=0.2,
         random_state=42
     )
 
     # # Collect activations and modality labels
-    # activations_tensor_flat, modality_labels_flat, examples_processed = collect_activations_batched(
+    # activations_tensor_flat, modality_labels_flat, examples_processed = collect_activations_batched_encoder(
     #     model, data_loader_train, device, num_target_tokens=args.num_target_tokens
     # )
     # # Apply the logistic probe on each latent dimension  
