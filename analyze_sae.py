@@ -1831,11 +1831,11 @@ if __name__ == '__main__':
     
     # Collect activations and modality labels for transformer probing
     print("\n=== Collecting activations for transformer neuron probing ===")
-    activations_tensor_flat, modality_labels_flat, examples_processed = collect_activations_batched_encoder(
-        model, data_loader_train, device, args)
-    # activations_tensor_flat, modality_labels_flat, examples_processed = collect_activations_batched_decoder(
-    #     model, data_loader_train, device, args
-    # )
+    # activations_tensor_flat, modality_labels_flat, examples_processed = collect_activations_batched_encoder(
+    #     model, data_loader_train, device, args)
+    activations_tensor_flat, modality_labels_flat, examples_processed = collect_activations_batched_decoder(
+        model, data_loader_train, device, args
+    )
     
     # Apply the dense probe on ALL transformer neurons simultaneously  
     apply_dense_probe_transformer(
@@ -1843,15 +1843,11 @@ if __name__ == '__main__':
         modality_labels_flat, 
         examples_processed,
         image_modality_id=image_modality_id,  # Use the dynamically found modality ID
-        output_prefix='image_encoder_dense',  
+        output_prefix='image_decoder_dense',  
         test_size=0.2,
         random_state=42
     )
 
-    # # Collect activations and modality labels
-    # activations_tensor_flat, modality_labels_flat, examples_processed = collect_activations_batched_encoder(
-    #     model, data_loader_train, device, num_target_tokens=args.num_target_tokens
-    # )
     # # Apply the logistic probe on each latent dimension  
     # apply_logistic_probe(
     #     activations_tensor_flat, 
