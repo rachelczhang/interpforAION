@@ -1837,29 +1837,30 @@ if __name__ == '__main__':
         model, data_loader_train, device, args
     )
     
-    # Apply the dense probe on ALL transformer neurons simultaneously  
-    apply_dense_probe_transformer(
-        activations_tensor_flat, 
-        modality_labels_flat, 
-        examples_processed,
-        image_modality_id=image_modality_id,  # Use the dynamically found modality ID
-        output_prefix='image_decoder_dense',  
-        test_size=0.2,
-        random_state=42
-    )
-
-    # # Apply the logistic probe on each latent dimension  
-    # apply_logistic_probe(
+    # # Apply the dense probe on ALL transformer neurons simultaneously  
+    # apply_dense_probe_transformer(
     #     activations_tensor_flat, 
     #     modality_labels_flat, 
-    #     examples_processed, 
-    #     autoencoder, 
-    #     device,
-    #     image_modality_id=18665,  # ID for tok_image
-    #     output_prefix='tok_image',  # Prefix for output files
+    #     examples_processed,
+    #     image_modality_id=image_modality_id,  # Use the dynamically found modality ID
+    #     # output_prefix = 'image_encoder_dense'
+    #     output_prefix='image_decoder_dense',  
     #     test_size=0.2,
     #     random_state=42
     # )
+
+    # Apply the logistic probe on each latent dimension  
+    apply_logistic_probe(
+        activations_tensor_flat, 
+        modality_labels_flat, 
+        examples_processed, 
+        autoencoder, 
+        device,
+        image_modality_id=18665,  # ID for tok_image
+        output_prefix='image_decoder_sae',  # Prefix for output files
+        test_size=0.2,
+        random_state=42
+    )
 
     # # Run PCA analysis
     # run_pca_analysis(
