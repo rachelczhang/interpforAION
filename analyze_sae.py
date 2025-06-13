@@ -39,7 +39,7 @@ class Args:
         self.text_tokenizer_path = "4Mclone/fourm/utils/tokenizer/trained/text_tokenizer_4m_wordpiece_30k.json"
         self.input_size = 224
         self.patch_size = 16
-        self.num_input_tokens = 128
+        self.num_input_tokens = 900
         self.num_target_tokens = 128
         self.min_input_tokens = None
         self.min_target_tokens = None
@@ -220,7 +220,7 @@ def plot_activation_frequencies_comparison(transformer_activations, autoencoder,
 
     return transformer_frequencies, autoencoder_frequencies
 
-def collect_activations_batched_encoder(model, data_loader, device, num_target_tokens):
+def collect_activations_batched_encoder(model, data_loader, device, args):
     """
     Collect activations from encoder block 8 while trusting AION's internal token selection.
     
@@ -235,14 +235,12 @@ def collect_activations_batched_encoder(model, data_loader, device, num_target_t
         model: AION model
         data_loader: DataLoader for input data
         device: Device to run on
-        num_target_tokens: Maximum number of tokens for AION to select
+        args: Arguments object containing num_input_tokens and other parameters
         
     Returns:
         tuple: (activations_tensor_flat, modality_labels_flat, examples_processed)
     """
     print("\n=== Starting Activation Collection ===")
-    print(f"Using num_target_tokens: {num_target_tokens}")
-    print("🔑 KEY: Capturing AION's EXACT token selection - no approximation!")
     
     activations = []
     modality_labels = [] 
@@ -264,7 +262,7 @@ def collect_activations_batched_encoder(model, data_loader, device, num_target_t
     # Store original embed_inputs method
     original_embed_inputs = model.embed_inputs
     
-    def instrumented_embed_inputs(input_dict, mask=None, num_encoder_tokens=256):
+    def instrumented_embed_inputs(input_dict, mask=None, num_encoder_tokens=args.num_input_tokens):
         """Instrumented version of embed_inputs that captures selection details"""
         
         print(f"\n🔍 DEBUGGING AION'S MASK-BASED SELECTION:")
@@ -284,7 +282,7 @@ def collect_activations_batched_encoder(model, data_loader, device, num_target_t
             else:
                 print(f"    No input mask provided - all tokens should be valid")
         
-        # Call the original method
+        # Call the original method - use whatever num_encoder_tokens was actually passed in
         encoder_tokens, encoder_emb, encoder_mask, mod_mask = original_embed_inputs(
             input_dict, mask=mask, num_encoder_tokens=num_encoder_tokens
         )
@@ -419,28 +417,19 @@ def collect_activations_batched_encoder(model, data_loader, device, num_target_t
             
             for mod, info in batch_before_selection.items():
                 print(f"  {mod}: {info['total_tokens_in_batch']} tokens (pos {info['start_index']}-{info['end_index']}), {info['mask_percentage']:.1f}% masked")
-                
-            num_encoder_tokens_to_use = 900 
-                
-            print(f"\nTotal input tokens: {total_tokens}")
-            print(f"Using num_encoder_tokens: {num_encoder_tokens_to_use}")
             
             # Concatenate modality labels for this batch
             if batch_modality_labels:
                 batch_modality_tensor = torch.cat(batch_modality_labels, dim=1)
                 print(f"\nTotal tokens across all modalities: {batch_modality_tensor.shape[1]}")
-                print(f"Model will intelligently select up to {num_encoder_tokens_to_use} tokens from these using AION's internal token selection")
+                print(f"Model will intelligently select up to {args.num_input_tokens} tokens from these using AION's internal token selection")
                 
                 # Store the full label tensor for later analysis
                 modality_labels.append(batch_modality_tensor)
-            else:
-                print("Warning: No modality labels created for this batch")
-                num_encoder_tokens_to_use = 256  # fallback
-                modality_labels.append(torch.full((current_batch_size, num_encoder_tokens_to_use), -1, dtype=torch.long, device='cpu'))
-
+          
             # Use model.encode() to get embeddings following the notebook pattern
             print(f"\n🚀 Running model.encode() - AION will now make its selection...")
-            embeddings = model.encode(input_dict, input_mask=input_mask_dict, num_encoder_tokens=num_encoder_tokens_to_use)
+            embeddings = model.encode(input_dict, input_mask=input_mask_dict, num_encoder_tokens=args.num_input_tokens)
             print(f"✅ Embeddings shape: {embeddings.shape}")
             
             # EXACT ANALYSIS: Use AION's captured selection information
@@ -676,6 +665,141 @@ def collect_activations_batched_encoder(model, data_loader, device, num_target_t
     print(f"Final dataset - Padding tokens (-1): {padding_count} tokens ({padding_percentage:.2f}%)")
     
     return activations_tensor_flat, modality_labels_flat, examples_processed
+
+def collect_activations_batched_decoder(
+    model,
+    data_loader,
+    device,
+    args,
+):
+    """Collect activations from **decoder** block 8 (index 8) in batches.
+
+    The procedure mirrors ``collect_activations_batched_encoder`` but focuses on the
+    decoder path.  We first obtain the encoder context, then run the model's
+    internal decoder up to block-8 while registering a forward hook that stores
+    the hidden states produced by that block.  The modality labels are taken
+    *directly* from the ``decoder_mod_mask`` returned by ``embed_targets`` so they
+    perfectly align with the hidden states.
+
+    Args:
+        model:  AION model (already loaded).
+        data_loader:  DataLoader that yields a batch-dict with keys per modality.
+        device:  Target device (cpu / cuda).
+        args: Arguments object containing num_target_tokens and num_input_tokens.
+
+    Returns:
+        activations_tensor_flat (torch.Tensor): (N*M, D) flattened decoder activations.
+        modality_labels_flat  (torch.Tensor): (N*M,) modality IDs aligned to activations.
+        examples_processed (int): Number of examples (N) encountered.
+    """
+
+    model = model.to(device).eval()
+
+    activations: list[torch.Tensor] = []
+    modality_labels: list[torch.Tensor] = []
+    examples_processed: int = 0
+
+    # ------------------------------------------------------------------
+    # 1. Register a hook on the 9-th decoder block (index 8)
+    # ------------------------------------------------------------------
+    def _hook(_module, _inp, output):
+        # Store hidden states on CPU to save GPU memory
+        activations.append(output.detach().cpu())
+
+    hook_handle = model.decoder[8].register_forward_hook(_hook)
+
+    # ------------------------------------------------------------------
+    # 2. Iterate over batches
+    # ------------------------------------------------------------------
+    with torch.no_grad():
+        for batch_idx, batch in enumerate(data_loader):
+            # Move batch tensors to the correct device
+            processed_batch = {
+                mod: {
+                    k: (v.to(device) if torch.is_tensor(v) else v)
+                    for k, v in d.items()
+                }
+                for mod, d in batch.items()
+            }
+
+            # ------------------------------------------------------------------
+            # Build the dictionaries expected by `embed_inputs` / `embed_targets`
+            # ------------------------------------------------------------------
+            input_dict: dict[str, torch.Tensor] = {}
+            input_mask: dict[str, torch.Tensor] = {}
+            target_mask: dict[str, torch.Tensor] = {}
+
+            for mod, d in processed_batch.items():
+                # Encoder side (always use the raw token tensor)
+                input_dict[mod] = d["tensor"]
+
+                if "input_mask" in d:
+                    input_mask[mod] = d["input_mask"].to(torch.bool)
+
+                # Decoder side: boolean mask indicating which positions are to be predicted
+                target_mask[mod] = d["target_mask"].to(torch.bool)
+
+            # ------------------------------------------------------------------
+            # Run through token selection utilities
+            # ------------------------------------------------------------------
+            enc_tokens, enc_emb, enc_mask, _ = model.embed_inputs(
+                input_dict,
+                mask=input_mask if len(input_mask) > 0 else None,
+                num_encoder_tokens=args.num_input_tokens,
+            )
+
+            (
+                dec_tokens,
+                dec_emb,
+                dec_mask,
+                _target_ids,  # not needed for probing
+                dec_att_mask,
+                dec_mod_mask,
+            ) = model.embed_targets(target_mask, num_decoder_tokens=args.num_target_tokens)
+
+            # ------------------------------------------------------------------
+            # Forward pass: encoder context -> decoder (hook captures block-8)
+            # ------------------------------------------------------------------
+            context = model._encode(enc_tokens, enc_emb, enc_mask)
+
+            _ = model._decode(
+                context,
+                enc_mask,
+                dec_tokens,
+                dec_emb,
+                dec_att_mask,
+            )  # hook fires here
+
+            # Store ground-truth modality labels for this batch
+            modality_labels.append(dec_mod_mask.cpu())
+
+            # House-keeping
+            batch_size = next(iter(processed_batch.values()))["tensor"].shape[0]
+            examples_processed += batch_size
+
+            torch.cuda.empty_cache()
+
+    # ------------------------------------------------------------------
+    # 3. Cleanup hook
+    # ------------------------------------------------------------------
+    hook_handle.remove()
+
+    # ------------------------------------------------------------------
+    # 4. Stack and flatten tensors
+    # ------------------------------------------------------------------
+    activations_tensor = torch.cat(activations, dim=0)           # (N, M, D)
+    modality_labels_tensor = torch.cat(modality_labels, dim=0)   # (N, M)
+
+    assert activations_tensor.shape[:2] == modality_labels_tensor.shape, (
+        "Decoder activations and modality labels mis-aligned: "
+        f"{activations_tensor.shape[:2]} vs {modality_labels_tensor.shape}"
+    )
+
+    N, M, D = activations_tensor.shape
+    activations_flat = activations_tensor.reshape(N * M, D)
+    labels_flat = modality_labels_tensor.reshape(-1)
+
+    return activations_flat, labels_flat, examples_processed
 
 def apply_logistic_probe(
     activations_tensor_flat, 
@@ -1479,7 +1603,7 @@ def run_tsne_analysis(model, autoencoder, data_loader_train, device, args, image
     try:
         # Collect activations and modality labels
         activations_tensor_flat, modality_labels_flat, examples_processed = collect_activations_batched_encoder(
-            model, data_loader_train, device, num_target_tokens=args.num_target_tokens
+            model, data_loader_train, device, args
         )
         print("Finished collecting activations!")
         
@@ -1549,7 +1673,7 @@ def run_pca_analysis(model, autoencoder, data_loader, device, args,
         # Collect activations
         print("\nCollecting activations...")
         activations_tensor_flat, modality_labels_flat, examples_processed = collect_activations_batched_encoder(
-            model, data_loader, device, num_target_tokens=args.num_target_tokens
+            model, data_loader, device, args
         )
         print("Finished collecting activations!")
         
@@ -1708,8 +1832,10 @@ if __name__ == '__main__':
     # Collect activations and modality labels for transformer probing
     print("\n=== Collecting activations for transformer neuron probing ===")
     activations_tensor_flat, modality_labels_flat, examples_processed = collect_activations_batched_encoder(
-        model, data_loader_train, device, num_target_tokens=args.num_target_tokens
-    )
+        model, data_loader_train, device, args)
+    # activations_tensor_flat, modality_labels_flat, examples_processed = collect_activations_batched_decoder(
+    #     model, data_loader_train, device, args
+    # )
     
     # Apply the dense probe on ALL transformer neurons simultaneously  
     apply_dense_probe_transformer(
@@ -1717,7 +1843,7 @@ if __name__ == '__main__':
         modality_labels_flat, 
         examples_processed,
         image_modality_id=image_modality_id,  # Use the dynamically found modality ID
-        output_prefix='image_transformer_dense',  # Updated prefix
+        output_prefix='image_encoder_dense',  
         test_size=0.2,
         random_state=42
     )
