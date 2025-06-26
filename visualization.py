@@ -73,121 +73,112 @@ def collect_activations_with_raw_data_mapping(
                 for mod, d in batch.items()
             }
 
+            # ------------------------------------------------------------------
+            # Build the dictionaries expected by `embed_inputs` / `embed_targets`
+            # ------------------------------------------------------------------
+            input_dict = {}
+            input_mask = {}
+            target_mask = {}
+
+            for mod, d in processed_batch.items():
+                # Encoder side (always use the raw token tensor)
+                input_dict[mod] = d["tensor"]
+
+                if "input_mask" in d:
+                    input_mask[mod] = d["input_mask"].to(torch.bool)
+
+                # Decoder side: boolean mask indicating which positions are to be predicted
+                target_mask[mod] = d["target_mask"].to(torch.bool)
+
             # Extract actual tokens and target masks for mapping purposes
             actual_tokens_at_positions = {}
-            target_mask = {}
             for mod, d in processed_batch.items():
                 actual_tokens_at_positions[mod] = d["tensor"]
-                target_mask[mod] = d.get("target_mask", torch.zeros_like(d["tensor"], dtype=torch.bool))
 
-            # 1. Prepare encoder embeddings
-            encoder_mod_dict = {
-                mod: model.encoder_embeddings[mod](d)
-                for mod, d in processed_batch.items()
-                if mod in model.encoder_embeddings
-            }
-            
-            # 2. Prepare decoder embeddings  
-            decoder_mod_dict = {
-                mod: model.decoder_embeddings[mod].forward_embed(d)
-                for mod, d in processed_batch.items()
-                if mod in model.decoder_embeddings
-            }
-            
-            # 3. Get encoder tokens and embeddings
-            encoder_tokens, encoder_emb, encoder_mask, encoder_mod_mask = \
-                model.forward_mask_encoder(encoder_mod_dict, args.num_input_tokens)
-            
-            # 4. Get decoder tokens and embeddings (this handles masking correctly)
-            (decoder_tokens, decoder_emb, decoder_mask, target_ids, 
-             decoder_attention_mask, dec_mod_mask) = \
-                model.forward_mask_decoder(decoder_mod_dict, args.num_target_tokens)
-            
+            # ------------------------------------------------------------------
+            # Run through token selection utilities using AION methods
+            # ------------------------------------------------------------------
+            enc_tokens, enc_emb, enc_mask, encoder_mod_mask = model.embed_inputs(
+                input_dict,
+                mask=input_mask if len(input_mask) > 0 else None,
+                num_encoder_tokens=args.num_input_tokens,
+            )
+
+            (
+                dec_tokens,
+                dec_emb,
+                dec_mask,
+                target_ids,
+                dec_att_mask,
+                dec_mod_mask,
+            ) = model.embed_targets(target_mask, num_decoder_tokens=args.num_target_tokens)
+
             # DEBUG: Check what the decoder is actually seeing vs actual tokens
             if batch_idx == 0:  # Only print for first batch
-                print(f"DEBUG: Decoder input (masked) tokens from batch {batch_idx}:")
-                print(f"  target_ids shape: {target_ids.shape}")
-                print(f"  First 10 target_ids (decoder sees): {target_ids[0, :10].tolist()}")
-                print(f"  Unique target_ids: {torch.unique(target_ids[0]).tolist()}")
+                print(f"DEBUG: Checking masking across all modalities")
+                print(f"target_ids: {target_ids[0, :10].tolist()}")
+                print(f"dec_mod_mask: {dec_mod_mask[0, :10].tolist()}")
+                print(f"dec_mask: {dec_mask[0, 0, :10].tolist()}")  # Note: dec_mask has shape (B, 1, M)
+                print(f"dec_emb: {dec_emb[0, :10].tolist()}")
+                print(f"dec_att_mask: {dec_att_mask[0, :10].tolist()}")
+
+                print(f"enc_mask: {enc_mask[0, 0, :10].tolist()}")  # Note: enc_mask has shape (B, 1, N)
+                print(f"encoder_mod_mask: {encoder_mod_mask[0, :10].tolist()}")
                 
-                # Show what actual tokens were at those positions
-                if len(actual_tokens_at_positions) > 0:
-                    first_mod = list(actual_tokens_at_positions.keys())[0]
-                    actual_sample = actual_tokens_at_positions[first_mod][0, :10]
-                    print(f"  First 10 actual tokens ({first_mod}): {actual_sample.tolist()}")
-                    print(f"  Decoder mod mask: {dec_mod_mask[0, :10].tolist()}")
+                # Check each modality's contribution
+                for mod_name, tokens in actual_tokens_at_positions.items():
+                    print(f"\nModality '{mod_name}':")
+                    print(f"  Original tokens: {tokens[0, :10].tolist()}")
+                    print(f"  Target mask: {target_mask[mod_name][0, :10].tolist()}")
+                    
+                    # Find which positions in the decoder sequence come from this modality
+                    mod_id = None
+                    if hasattr(model, 'modality_info') and mod_name in model.modality_info:
+                        mod_id = model.modality_info[mod_name]['id']
+                        positions_from_this_mod = (dec_mod_mask[0] == mod_id).nonzero().flatten()
+                        print(f"  Modality ID: {mod_id}")
+                        print(f"  Positions in decoder: {positions_from_this_mod.tolist()}")           
+                        # Show what decoder sees at those positions
+                        decoder_tokens_for_this_mod = target_ids[0][positions_from_this_mod]
+                        print(f"  Decoder sees tokens: {decoder_tokens_for_this_mod.tolist()}")
 
-            # 5. Forward through encoder
-            x = encoder_tokens + encoder_emb
-            x = model.forward_encoder(x, encoder_mask=encoder_mask)
-            
-            # 6. Prepare decoder input (this is the key part you were missing)
-            context = model.decoder_proj_context(x) + encoder_emb
-            y = decoder_tokens + decoder_emb  # This is what actually goes to decoder
-            
-            # 7. Forward through decoder (hook captures activations)
-            y = model.forward_decoder(
-                y,
+                # NEW: Critical debug - check if ANY position has prediction masking
+                print(f"\n=== CRITICAL DEBUG ===")
+                for mod_name in target_mask.keys():
+                    mask_values = target_mask[mod_name][0]
+                    false_count = (mask_values == False).sum().item()
+                    true_count = (mask_values == True).sum().item()
+                    print(f"Modality {mod_name}: {false_count} positions to predict, {true_count} positions not to predict")
+                
+                decoder_mask_values = dec_mask[0, 0]  # Remove batch and attention dims
+                false_count = (decoder_mask_values == False).sum().item()
+                true_count = (decoder_mask_values == True).sum().item()
+                print(f"Final decoder mask: {false_count} unmasked positions, {true_count} masked positions")
+                print(f"=== END CRITICAL DEBUG ===")
+
+            # ------------------------------------------------------------------
+            # Forward pass: encoder context -> decoder (hook captures block-8)
+            # ------------------------------------------------------------------
+            context = model._encode(enc_tokens, enc_emb, enc_mask)
+
+            _ = model._decode(
                 context,
-                encoder_mask=encoder_mask,
-                decoder_attention_mask=decoder_attention_mask,
-            )
-            # # Build the dictionaries expected by embed_inputs / embed_targets
-            # input_dict = {}
-            # input_mask = {}
-            # target_mask = {}
-
-            # for mod, d in processed_batch.items():
-            #     input_dict[mod] = d["tensor"]
-            #     if "input_mask" in d:
-            #         input_mask[mod] = d["input_mask"].to(torch.bool)
-            #     target_mask[mod] = d["target_mask"].to(torch.bool)
-
-            # # Run through token selection utilities
-            # enc_tokens, enc_emb, enc_mask, _ = model.embed_inputs(
-            #     input_dict,
-            #     mask=input_mask if len(input_mask) > 0 else None,
-            #     num_encoder_tokens=args.num_input_tokens,
-            # )
-
-            # # FIXED: Use proper embed_targets which creates masked tokens for prediction
-            # # This is the correct way - decoder should see masked tokens, not actual tokens
-            # (
-            #     dec_tokens,
-            #     dec_emb,
-            #     dec_mask,
-            #     target_ids,  # These will be zeros where masked, but we track actual tokens separately
-            #     dec_att_mask,
-            #     dec_mod_mask,
-            # ) = model.embed_targets(target_mask, num_decoder_tokens=args.num_target_tokens)
-            
-            # # CRITICAL: Also extract the actual tokens at masked positions for tracking
-            # # We need this to map activations back to what the decoder was trying to predict
-            # actual_tokens_at_positions = {}
-            # for mod, mask in target_mask.items():
-            #     # Get the actual tokens from the original tensor
-            #     actual_tokens_at_positions[mod] = processed_batch[mod]["tensor"]
-
-            # # Forward pass: encoder context -> decoder (hook captures block-8)
-            # context = model._encode(enc_tokens, enc_emb, enc_mask)
-            # _ = model._decode(
-            #     context,
-            #     enc_mask,
-            #     dec_tokens,
-            #     dec_emb,
-            #     dec_att_mask,
-            # )  # hook fires here
+                enc_mask,
+                dec_tokens,
+                dec_emb,
+                dec_att_mask,
+            )  # hook fires here
 
             # Store the decoder tokens that were processed AND the actual tokens for mapping
             decoder_tokens_cache[batch_idx] = {
-                'dec_tokens': decoder_tokens.detach().cpu(),  # Shape: (batch_size, seq_len, embed_dim) - what decoder saw
+                'dec_tokens': dec_tokens.detach().cpu(),  # Shape: (batch_size, seq_len, embed_dim) - what decoder saw
                 'target_ids': target_ids.detach().cpu(),  # Shape: (batch_size, seq_len) - what decoder saw (mostly zeros)
                 'dec_mod_mask': dec_mod_mask.detach().cpu(),  # Modality labels for each token
-                'decoder_mask': decoder_mask.detach().cpu(),  # Boolean mask indicating which tokens were masked (True) or kept (False)
+                'decoder_mask': dec_mask.detach().cpu(),  # Boolean mask indicating which tokens were masked (True) or kept (False)
                 'actual_tokens': {mod: tokens.detach().cpu() for mod, tokens in actual_tokens_at_positions.items()},  # NEW: actual tokens
                 'target_mask': {mod: mask.detach().cpu() for mod, mask in target_mask.items()},  # NEW: masks for mapping
-                'batch_size': decoder_tokens.shape[0],
-                'seq_len': decoder_tokens.shape[1],
+                'batch_size': dec_tokens.shape[0],
+                'seq_len': dec_tokens.shape[1],
             }
 
             # Store ground-truth modality labels for this batch
