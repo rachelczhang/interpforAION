@@ -6,6 +6,7 @@ import matplotlib.pyplot as plt
 import seaborn as sns
 import numpy as np 
 import os 
+import time
 import sys
 import traceback
 from save_activations import get_data
@@ -20,17 +21,23 @@ from sklearn.metrics import log_loss, accuracy_score, balanced_accuracy_score, f
 from sklearn.linear_model import LogisticRegression
 from scipy.optimize import minimize
 import pandas as pd
+from aion import AION
 from sklearn.manifold import TSNE
 from sklearn.decomposition import PCA
 from sklearn.preprocessing import StandardScaler
+from visualization import collect_activations_with_raw_data_mapping, top_k_inputs_for_sae_latent_neuron_n
+
+# from top_activations import (
+#     collect_activations_and_their_inputs_tokens_and_modalities,
+#     top_k_activating_tokens_and_modalities_for_latent_neuron_n,
+# )
+
 # Get the current script's directory
 current_dir = os.path.dirname(os.path.abspath(__file__))
 
 # Add both directories to sys.path
 sys.path.append(os.path.join(current_dir, "AION"))
 sys.path.append(os.path.join(current_dir, "4Mclone"))
-
-from aion import AION
 
 class Args:
     """Simple class to hold arguments needed for setup functions."""
@@ -378,7 +385,7 @@ def collect_activations_batched_encoder(model, data_loader, device, args):
                     batch_before_selection[mod] = {
                         'id': mod_id,
                         'tokens_per_example': num_tokens,
-                        'total_tokens_in_batch': tokens_this_mod,
+                        'total_tokens_in_batch': tokens_this_mod,  # Track position in concatenated sequence
                         'start_index': total_tokens,  # Track position in concatenated sequence
                         'end_index': total_tokens + num_tokens - 1
                     }
@@ -1238,521 +1245,534 @@ def apply_dense_probe_transformer(
     
     return results, dense_model, weights_df
 
-def plot_tsne_visualization(activations_tensor_flat, modality_labels_flat, autoencoder, device, 
-                          image_modality_id=18665, output_prefix='image_tsne', perplexity=30, 
-                          n_iter=1000, random_state=42):
-    """
-    Create TSNE visualization of activations with different colors for image vs non-image positions.
+# def plot_tsne_visualization(activations_tensor_flat, modality_labels_flat, autoencoder, device, 
+#                           image_modality_id=18665, output_prefix='image_tsne', perplexity=30, 
+#                           n_iter=1000, random_state=42):
+#     """
+#     Create TSNE visualization of activations with different colors for image vs non-image positions.
     
-    Args:
-        activations_tensor_flat: Flattened tensor of activations [n_samples, hidden_dim]
-        modality_labels_flat: Flattened tensor of binary labels [n_samples] (1=image, 0=non-image, -1=padding)
-        autoencoder: Trained sparse autoencoder model
-        device: Device to run computations on
-        image_modality_id: ID for image modality (unused but kept for compatibility)
-        output_prefix: Prefix for output files
-        perplexity: TSNE perplexity parameter
-        n_iter: Number of TSNE iterations
-        random_state: Random seed for reproducibility
-    """
-    print("\nStarting TSNE visualization...")
+#     Args:
+#         activations_tensor_flat: Flattened tensor of activations [n_samples, hidden_dim]
+#         modality_labels_flat: Flattened tensor of binary labels [n_samples] (1=image, 0=non-image, -1=padding)
+#         autoencoder: Trained sparse autoencoder model
+#         device: Device to run computations on
+#         image_modality_id: ID for image modality (unused but kept for compatibility)
+#         output_prefix: Prefix for output files
+#         perplexity: TSNE perplexity parameter
+#         n_iter: Number of TSNE iterations
+#         random_state: Random seed for reproducibility
+#     """
+#     print("\nStarting TSNE visualization...")
     
-    # Move tensors to CPU to avoid CUDA memory issues
-    print("Moving tensors to CPU...")
-    activations_tensor_flat = activations_tensor_flat.cpu()
-    modality_labels_flat = modality_labels_flat.cpu()
+#     # Move tensors to CPU to avoid CUDA memory issues
+#     print("Moving tensors to CPU...")
+#     activations_tensor_flat = activations_tensor_flat.cpu()
+#     modality_labels_flat = modality_labels_flat.cpu()
     
-    # Filter out padding tokens (-1)
-    print("Filtering padding tokens...")
-    valid_mask = modality_labels_flat != -1
-    activations_filtered = activations_tensor_flat[valid_mask]
-    labels_filtered = modality_labels_flat[valid_mask]
+#     # Filter out padding tokens (-1)
+#     print("Filtering padding tokens...")
+#     valid_mask = modality_labels_flat != -1
+#     activations_filtered = activations_tensor_flat[valid_mask]
+#     labels_filtered = modality_labels_flat[valid_mask]
     
-    print(f"Filtered activations shape: {activations_filtered.shape}")
-    print(f"Number of valid samples: {valid_mask.sum().item()}")
-    print(f"Image positions (label=1): {(labels_filtered == 1).sum().item()}")
-    print(f"Non-image positions (label=0): {(labels_filtered == 0).sum().item()}")
+#     print(f"Filtered activations shape: {activations_filtered.shape}")
+#     print(f"Number of valid samples: {valid_mask.sum().item()}")
+#     print(f"Image positions (label=1): {(labels_filtered == 1).sum().item()}")
+#     print(f"Non-image positions (label=0): {(labels_filtered == 0).sum().item()}")
     
-    # Process autoencoder activations in chunks to avoid memory issues
-    chunk_size = 10000
-    autoencoder_acts_list = []
+#     # Process autoencoder activations in chunks to avoid memory issues
+#     chunk_size = 10000
+#     autoencoder_acts_list = []
     
-    print("\nProcessing activations through autoencoder...")
-    for start_idx in tqdm(range(0, len(activations_filtered), chunk_size)):
-        end_idx = min(start_idx + chunk_size, len(activations_filtered))
-        chunk = activations_filtered[start_idx:end_idx].to(device)
+#     print("\nProcessing activations through autoencoder...")
+#     for start_idx in tqdm(range(0, len(activations_filtered), chunk_size)):
+#         end_idx = min(start_idx + chunk_size, len(activations_filtered))
+#         chunk = activations_filtered[start_idx:end_idx].to(device)
         
-        with torch.no_grad():
-            try:
-                _, encoded = autoencoder(chunk)
-                autoencoder_acts_list.append(encoded.cpu())
-                # Clear CUDA cache after each chunk
-                torch.cuda.empty_cache()
-            except Exception as e:
-                print(f"Error processing chunk {start_idx}-{end_idx}: {str(e)}")
-                print(f"Traceback:\n{traceback.format_exc()}")
-                continue
+#         with torch.no_grad():
+#             try:
+#                 _, encoded = autoencoder(chunk)
+#                 autoencoder_acts_list.append(encoded.cpu())
+#                 # Clear CUDA cache after each chunk
+#                 torch.cuda.empty_cache()
+#             except Exception as e:
+#                 print(f"Error processing chunk {start_idx}-{end_idx}: {str(e)}")
+#                 print(f"Traceback:\n{traceback.format_exc()}")
+#                 continue
     
-    # Concatenate all chunks
-    print("\nConcatenating autoencoder activations...")
-    autoencoder_acts = torch.cat(autoencoder_acts_list, dim=0)
-    print(f"Autoencoder activations shape: {autoencoder_acts.shape}")
+#     # Concatenate all chunks
+#     print("\nConcatenating autoencoder activations...")
+#     autoencoder_acts = torch.cat(autoencoder_acts_list, dim=0)
+#     print(f"Autoencoder activations shape: {autoencoder_acts.shape}")
     
-    # Convert to numpy and free GPU memory
-    print("Converting to numpy array...")
-    autoencoder_acts_np = autoencoder_acts.numpy()
-    del autoencoder_acts
-    del autoencoder_acts_list
-    torch.cuda.empty_cache()
+#     # Convert to numpy and free GPU memory
+#     print("Converting to numpy array...")
+#     autoencoder_acts_np = autoencoder_acts.numpy()
+#     del autoencoder_acts
+#     del autoencoder_acts_list
+#     torch.cuda.empty_cache()
     
-    # Apply TSNE with memory-efficient settings
-    print("\nApplying TSNE...")
-    try:
-        print("Initializing TSNE with parameters:")
-        print(f"- perplexity: {perplexity}")
-        print(f"- n_iter: {n_iter}")
-        print(f"- random_state: {random_state}")
-        print(f"- n_jobs: -1 (using all CPU cores)")
-        print(f"- method: barnes_hut (memory efficient)")
-        print(f"- angle: 0.5 (trade-off between accuracy and speed)")
+#     # Apply TSNE with memory-efficient settings
+#     print("\nApplying TSNE...")
+#     try:
+#         print("Initializing TSNE with parameters:")
+#         print(f"- perplexity: {perplexity}")
+#         print(f"- n_iter: {n_iter}")
+#         print(f"- random_state: {random_state}")
+#         print(f"- n_jobs: -1 (using all CPU cores)")
+#         print(f"- method: barnes_hut (memory efficient)")
+#         print(f"- angle: 0.5 (trade-off between accuracy and speed)")
         
-        # Use more memory-efficient settings
-        tsne = TSNE(
-            n_components=2,
-            perplexity=min(perplexity, 30),  # Cap perplexity at 30
-            n_iter=min(n_iter, 500),  # Reduce iterations
-            random_state=random_state,
-            verbose=2,  # More verbose output
-            n_jobs=-1,  # Use all CPU cores
-            method='barnes_hut',  # More memory efficient method
-            angle=0.5,  # Trade-off between accuracy and speed
-            init='pca'  # Use PCA initialization for better convergence
-        )
+#         # Use more memory-efficient settings
+#         tsne = TSNE(
+#             n_components=2,
+#             perplexity=min(perplexity, 30),  # Cap perplexity at 30
+#             n_iter=min(n_iter, 500),  # Reduce iterations
+#             random_state=random_state,
+#             verbose=2,  # More verbose output
+#             n_jobs=-1,  # Use all CPU cores
+#             method='barnes_hut',  # More memory efficient method
+#             angle=0.5,  # Trade-off between accuracy and speed
+#             init='pca'  # Use PCA initialization for better convergence
+#         )
         
-        print("Starting TSNE fit_transform...")
-        latents_2d = tsne.fit_transform(autoencoder_acts_np)
-        print("TSNE completed successfully")
+#         print("Starting TSNE fit_transform...")
+#         latents_2d = tsne.fit_transform(autoencoder_acts_np)
+#         print("TSNE completed successfully")
         
-        # Free memory
-        del autoencoder_acts_np
-        torch.cuda.empty_cache()
+#         # Free memory
+#         del autoencoder_acts_np
+#         torch.cuda.empty_cache()
         
-    except Exception as e:
-        print(f"Error during TSNE: {str(e)}")
-        print(f"Traceback:\n{traceback.format_exc()}")
-        return None, None
+#     except Exception as e:
+#         print(f"Error during TSNE: {str(e)}")
+#         print(f"Traceback:\n{traceback.format_exc()}")
+#         return None, None
     
-    # Create visualization
-    print("\nCreating visualization...")
-    plt.figure(figsize=(12, 8))
+#     # Create visualization
+#     print("\nCreating visualization...")
+#     plt.figure(figsize=(12, 8))
     
-    # Plot points with different colors for different positions
-    print("Plotting points...")
-    # Plot non-image positions in gray
-    non_image_mask = labels_filtered == 0
-    if non_image_mask.any():
-        plt.scatter(latents_2d[non_image_mask, 0], latents_2d[non_image_mask, 1], 
-                   c='gray', alpha=0.1, s=1, label='Non-image positions')
+#     # Plot points with different colors for different positions
+#     print("Plotting points...")
+#     # Plot non-image positions in gray
+#     non_image_mask = labels_filtered == 0
+#     if non_image_mask.any():
+#         plt.scatter(latents_2d[non_image_mask, 0], latents_2d[non_image_mask, 1], 
+#                    c='gray', alpha=0.1, s=1, label='Non-image positions')
     
-    # Highlight image positions in red
-    print("Highlighting image positions...")
-    image_mask = labels_filtered == 1
-    if image_mask.any():
-        plt.scatter(latents_2d[image_mask, 0], latents_2d[image_mask, 1], 
-                   c='red', alpha=0.5, s=2, label='Image positions')
+#     # Highlight image positions in red
+#     print("Highlighting image positions...")
+#     image_mask = labels_filtered == 1
+#     if image_mask.any():
+#         plt.scatter(latents_2d[image_mask, 0], latents_2d[image_mask, 1], 
+#                    c='red', alpha=0.5, s=2, label='Image positions')
     
-    plt.title('t-SNE Visualization of Autoencoder Activations\n(Image vs Non-Image Positions)')
-    plt.xlabel('t-SNE dimension 1')
-    plt.ylabel('t-SNE dimension 2')
-    plt.legend()
+#     plt.title('t-SNE Visualization of Autoencoder Activations\n(Image vs Non-Image Positions)')
+#     plt.xlabel('t-SNE dimension 1')
+#     plt.ylabel('t-SNE dimension 2')
+#     plt.legend()
     
-    # Save plot
-    print("Saving plot...")
-    output_file = f'{output_prefix}_tsne.png'
-    plt.savefig(output_file, dpi=300, bbox_inches='tight')
-    plt.close()
-    print(f"Saved visualization to {output_file}")
+#     # Save plot
+#     print("Saving plot...")
+#     output_file = f'{output_prefix}_tsne.png'
+#     plt.savefig(output_file, dpi=300, bbox_inches='tight')
+#     plt.close()
+#     print(f"Saved visualization to {output_file}")
     
-    # Clean up
-    print("Cleaning up...")
-    torch.cuda.empty_cache()
+#     # Clean up
+#     print("Cleaning up...")
+#     torch.cuda.empty_cache()
     
-    return latents_2d
+#     return latents_2d
 
-def plot_pca_visualization(activations_tensor_flat, modality_labels_flat, autoencoder, device, 
-                          image_modality_id, output_prefix, n_components, 
-                          standardize, random_state):
-    """
-    Create PCA visualization of activations with different colors for image vs non-image tokens.
-    Also analyze distances to check for radial structure.
+# def plot_pca_visualization(activations_tensor_flat, modality_labels_flat, autoencoder, device, 
+#                           image_modality_id, output_prefix, n_components, 
+#                           standardize, random_state):
+#     """
+#     Create PCA visualization of activations with different colors for image vs non-image tokens.
+#     Also analyze distances to check for radial structure.
     
-    Args:
-        activations_tensor_flat: Flattened tensor of activations [n_samples, hidden_dim]
-        modality_labels_flat: Flattened tensor of modality labels [n_samples]
-        autoencoder: Trained sparse autoencoder model
-        device: Device to run computations on
-        image_modality_id: ID for image modality tokens
-        output_prefix: Prefix for output files
-        n_components: Number of PCA components (2 for visualization)
-        standardize: Whether to standardize features before PCA
-        random_state: Random seed for reproducibility
-    """
-    print("\nStarting PCA visualization...")
+#     Args:
+#         activations_tensor_flat: Flattened tensor of activations [n_samples, hidden_dim]
+#         modality_labels_flat: Flattened tensor of modality labels [n_samples]
+#         autoencoder: Trained sparse autoencoder model
+#         device: Device to run computations on
+#         image_modality_id: ID for image modality tokens
+#         output_prefix: Prefix for output files
+#         n_components: Number of PCA components (2 for visualization)
+#         standardize: Whether to standardize features before PCA
+#         random_state: Random seed for reproducibility
+#     """
+#     print("\nStarting PCA visualization...")
     
-    # Move tensors to CPU to avoid CUDA memory issues
-    print("Moving tensors to CPU...")
-    activations_tensor_flat = activations_tensor_flat.cpu()
-    modality_labels_flat = modality_labels_flat.cpu()
+#     # Move tensors to CPU to avoid CUDA memory issues
+#     print("Moving tensors to CPU...")
+#     activations_tensor_flat = activations_tensor_flat.cpu()
+#     modality_labels_flat = modality_labels_flat.cpu()
     
-    # Filter out padding tokens (-1)
-    print("Filtering padding tokens...")
-    valid_mask = modality_labels_flat != -1
-    activations_filtered = activations_tensor_flat[valid_mask]
-    labels_filtered = modality_labels_flat[valid_mask]
+#     # Filter out padding tokens (-1)
+#     print("Filtering padding tokens...")
+#     valid_mask = modality_labels_flat != -1
+#     activations_filtered = activations_tensor_flat[valid_mask]
+#     labels_filtered = modality_labels_flat[valid_mask]
     
-    print(f"Filtered activations shape: {activations_filtered.shape}")
-    print(f"Number of valid samples: {valid_mask.sum().item()}")
-    print(f"Image tokens: {(labels_filtered == image_modality_id).sum().item()}")
+#     print(f"Filtered activations shape: {activations_filtered.shape}")
+#     print(f"Number of valid samples: {valid_mask.sum().item()}")
+#     print(f"Image tokens: {(labels_filtered == image_modality_id).sum().item()}")
     
-    # Process autoencoder activations in chunks to avoid memory issues
-    chunk_size = 10000
-    autoencoder_acts_list = []
+#     # Process autoencoder activations in chunks to avoid memory issues
+#     chunk_size = 10000
+#     autoencoder_acts_list = []
     
-    print("\nProcessing activations through autoencoder...")
-    for start_idx in tqdm(range(0, len(activations_filtered), chunk_size)):
-        end_idx = min(start_idx + chunk_size, len(activations_filtered))
-        chunk = activations_filtered[start_idx:end_idx].to(device)
+#     print("\nProcessing activations through autoencoder...")
+#     for start_idx in tqdm(range(0, len(activations_filtered), chunk_size)):
+#         end_idx = min(start_idx + chunk_size, len(activations_filtered))
+#         chunk = activations_filtered[start_idx:end_idx].to(device)
         
-        with torch.no_grad():
-            try:
-                _, encoded = autoencoder(chunk)
-                autoencoder_acts_list.append(encoded.cpu())
-                # Clear CUDA cache after each chunk
-                torch.cuda.empty_cache()
-            except Exception as e:
-                print(f"Error processing chunk {start_idx}-{end_idx}: {str(e)}")
-                print(f"Traceback:\n{traceback.format_exc()}")
-                continue
+#         with torch.no_grad():
+#             try:
+#                 _, encoded = autoencoder(chunk)
+#                 autoencoder_acts_list.append(encoded.cpu())
+#                 # Clear CUDA cache after each chunk
+#                 torch.cuda.empty_cache()
+#             except Exception as e:
+#                 print(f"Error processing chunk {start_idx}-{end_idx}: {str(e)}")
+#                 print(f"Traceback:\n{traceback.format_exc()}")
+#                 continue
     
-    # Concatenate all chunks
-    print("\nConcatenating autoencoder activations...")
-    autoencoder_acts = torch.cat(autoencoder_acts_list, dim=0)
-    print(f"Autoencoder activations shape: {autoencoder_acts.shape}")
+#     # Concatenate all chunks
+#     print("\nConcatenating autoencoder activations...")
+#     autoencoder_acts = torch.cat(autoencoder_acts_list, dim=0)
+#     print(f"Autoencoder activations shape: {autoencoder_acts.shape}")
     
-    # Convert to numpy and free GPU memory
-    print("Converting to numpy array...")
-    autoencoder_acts_np = autoencoder_acts.numpy()
-    del autoencoder_acts
-    del autoencoder_acts_list
-    torch.cuda.empty_cache()
+#     # Convert to numpy and free GPU memory
+#     print("Converting to numpy array...")
+#     autoencoder_acts_np = autoencoder_acts.numpy()
+#     del autoencoder_acts
+#     del autoencoder_acts_list
+#     torch.cuda.empty_cache()
     
-    # Standardize features if requested
-    if standardize:
-        print("Standardizing features...")
-        scaler = StandardScaler()
-        autoencoder_acts_np = scaler.fit_transform(autoencoder_acts_np)
+#     # Standardize features if requested
+#     if standardize:
+#         print("Standardizing features...")
+#         scaler = StandardScaler()
+#         autoencoder_acts_np = scaler.fit_transform(autoencoder_acts_np)
     
-    # Apply PCA
-    print(f"\nApplying PCA with {n_components} components...")
-    try:
-        pca = PCA(n_components=n_components, random_state=random_state)
-        latents_2d = pca.fit_transform(autoencoder_acts_np)
-        print("PCA completed successfully")
+#     # Apply PCA
+#     print(f"\nApplying PCA with {n_components} components...")
+#     try:
+#         pca = PCA(n_components=n_components, random_state=random_state)
+#         latents_2d = pca.fit_transform(autoencoder_acts_np)
+#         print("PCA completed successfully")
         
-        # Print explained variance
-        explained_var = pca.explained_variance_ratio_
-        print(f"Explained variance ratio: {explained_var}")
-        print(f"Total explained variance: {explained_var.sum():.4f}")
+#         # Print explained variance
+#         explained_var = pca.explained_variance_ratio_
+#         print(f"Explained variance ratio: {explained_var}")
+#         print(f"Total explained variance: {explained_var.sum():.4f}")
         
-        # Free memory
-        del autoencoder_acts_np
-        torch.cuda.empty_cache()
+#         # Free memory
+#         del autoencoder_acts_np
+#         torch.cuda.empty_cache()
         
-    except Exception as e:
-        print(f"Error during PCA: {str(e)}")
-        print(f"Traceback:\n{traceback.format_exc()}")
-        return None, None
+#     except Exception as e:
+#         print(f"Error during PCA: {str(e)}")
+#         print(f"Traceback:\n{traceback.format_exc()}")
+#         return None, None
     
-    # Analyze distances to check for radial structure
-    print("\nAnalyzing distance patterns...")
-    image_mask = labels_filtered == image_modality_id
+#     # Analyze distances to check for radial structure
+#     print("\nAnalyzing distance patterns...")
+#     image_mask = labels_filtered == image_modality_id
     
-    # Calculate centroids
-    all_centroid = np.mean(latents_2d, axis=0)
-    gray_centroid = np.mean(latents_2d[~image_mask], axis=0)
-    red_centroid = np.mean(latents_2d[image_mask], axis=0)
+#     # Calculate centroids
+#     all_centroid = np.mean(latents_2d, axis=0)
+#     gray_centroid = np.mean(latents_2d[~image_mask], axis=0)
+#     red_centroid = np.mean(latents_2d[image_mask], axis=0)
     
-    # Calculate distances from centroids
-    red_distances_from_all = np.linalg.norm(latents_2d[image_mask] - all_centroid, axis=1)
-    gray_distances_from_all = np.linalg.norm(latents_2d[~image_mask] - all_centroid, axis=1)
-    red_distances_from_gray = np.linalg.norm(latents_2d[image_mask] - gray_centroid, axis=1)
+#     # Calculate distances from centroids
+#     red_distances_from_all = np.linalg.norm(latents_2d[image_mask] - all_centroid, axis=1)
+#     gray_distances_from_all = np.linalg.norm(latents_2d[~image_mask] - all_centroid, axis=1)
+#     red_distances_from_gray = np.linalg.norm(latents_2d[image_mask] - gray_centroid, axis=1)
     
-    # Print distance statistics
-    print(f"\nDistance Analysis:")
-    print(f"Red points distance from overall centroid: {red_distances_from_all.mean():.4f} ± {red_distances_from_all.std():.4f}")
-    print(f"Gray points distance from overall centroid: {gray_distances_from_all.mean():.4f} ± {gray_distances_from_all.std():.4f}")
-    print(f"Red points distance from gray centroid: {red_distances_from_gray.mean():.4f} ± {red_distances_from_gray.std():.4f}")
+#     # Print distance statistics
+#     print(f"\nDistance Analysis:")
+#     print(f"Red points distance from overall centroid: {red_distances_from_all.mean():.4f} ± {red_distances_from_all.std():.4f}")
+#     print(f"Gray points distance from overall centroid: {gray_distances_from_all.mean():.4f} ± {gray_distances_from_all.std():.4f}")
+#     print(f"Red points distance from gray centroid: {red_distances_from_gray.mean():.4f} ± {red_distances_from_gray.std():.4f}")
     
-    # Check if red points form a shell around gray points
-    red_mean_dist = red_distances_from_gray.mean()
-    red_std_dist = red_distances_from_gray.std()
-    shell_coefficient = red_std_dist / red_mean_dist  # Lower values suggest more shell-like
-    print(f"Shell coefficient (std/mean of red distances from gray): {shell_coefficient:.4f}")
-    print(f"Lower values suggest more shell-like arrangement")
+#     # Check if red points form a shell around gray points
+#     red_mean_dist = red_distances_from_gray.mean()
+#     red_std_dist = red_distances_from_gray.std()
+#     shell_coefficient = red_std_dist / red_mean_dist  # Lower values suggest more shell-like
+#     print(f"Shell coefficient (std/mean of red distances from gray): {shell_coefficient:.4f}")
+#     print(f"Lower values suggest more shell-like arrangement")
     
-    # Create visualization
-    print("\nCreating PCA visualization...")
-    fig, ((ax1, ax2), (ax3, ax4)) = plt.subplots(2, 2, figsize=(15, 12))
+#     # Create visualization
+#     print("\nCreating PCA visualization...")
+#     fig, ((ax1, ax2), (ax3, ax4)) = plt.subplots(2, 2, figsize=(15, 12))
     
-    # Plot 1: Main PCA visualization
-    ax1.scatter(latents_2d[~image_mask, 0], latents_2d[~image_mask, 1], 
-               c='gray', alpha=0.1, s=1, label='Other modalities')
-    if image_mask.any():
-        ax1.scatter(latents_2d[image_mask, 0], latents_2d[image_mask, 1], 
-                   c='red', alpha=0.5, s=2, label='Image modality')
+#     # Plot 1: Main PCA visualization
+#     ax1.scatter(latents_2d[~image_mask, 0], latents_2d[~image_mask, 1], 
+#                c='gray', alpha=0.1, s=1, label='Other modalities')
+#     if image_mask.any():
+#         ax1.scatter(latents_2d[image_mask, 0], latents_2d[image_mask, 1], 
+#                    c='red', alpha=0.5, s=2, label='Image modality')
     
-    ax1.scatter(*all_centroid, c='blue', s=100, marker='x', label='Overall centroid')
-    ax1.scatter(*gray_centroid, c='black', s=100, marker='+', label='Gray centroid')
-    ax1.scatter(*red_centroid, c='darkred', s=100, marker='*', label='Red centroid')
+#     ax1.scatter(*all_centroid, c='blue', s=100, marker='x', label='Overall centroid')
+#     ax1.scatter(*gray_centroid, c='black', s=100, marker='+', label='Gray centroid')
+#     ax1.scatter(*red_centroid, c='darkred', s=100, marker='*', label='Red centroid')
     
-    ax1.set_title(f'PCA Visualization\n(Explained variance: {explained_var.sum():.3f})')
-    ax1.set_xlabel(f'PC1 ({explained_var[0]:.3f})')
-    ax1.set_ylabel(f'PC2 ({explained_var[1]:.3f})')
-    ax1.legend()
-    ax1.grid(True, alpha=0.3)
+#     ax1.set_title(f'PCA Visualization\n(Explained variance: {explained_var.sum():.3f})')
+#     ax1.set_xlabel(f'PC1 ({explained_var[0]:.3f})')
+#     ax1.set_ylabel(f'PC2 ({explained_var[1]:.3f})')
+#     ax1.legend()
+#     ax1.grid(True, alpha=0.3)
     
-    # Plot 2: Distance distributions
-    ax2.hist(red_distances_from_gray, bins=50, alpha=0.7, label='Red from gray centroid', color='red')
-    ax2.hist(gray_distances_from_all, bins=50, alpha=0.7, label='Gray from overall centroid', color='gray')
-    ax2.set_xlabel('Distance')
-    ax2.set_ylabel('Count')
-    ax2.set_title('Distance Distributions')
-    ax2.legend()
-    ax2.grid(True, alpha=0.3)
+#     # Plot 2: Distance distributions
+#     ax2.hist(red_distances_from_gray, bins=50, alpha=0.7, label='Red from gray centroid', color='red')
+#     ax2.hist(gray_distances_from_all, bins=50, alpha=0.7, label='Gray from overall centroid', color='gray')
+#     ax2.set_xlabel('Distance')
+#     ax2.set_ylabel('Count')
+#     ax2.set_title('Distance Distributions')
+#     ax2.legend()
+#     ax2.grid(True, alpha=0.3)
     
-    # Plot 3: Polar plot to check radial structure
-    if image_mask.any():
-        # Convert red points to polar coordinates relative to gray centroid
-        red_relative = latents_2d[image_mask] - gray_centroid
-        red_angles = np.arctan2(red_relative[:, 1], red_relative[:, 0])
-        red_radii = np.linalg.norm(red_relative, axis=1)
+#     # Plot 3: Polar plot to check radial structure
+#     if image_mask.any():
+#         # Convert red points to polar coordinates relative to gray centroid
+#         red_relative = latents_2d[image_mask] - gray_centroid
+#         red_angles = np.arctan2(red_relative[:, 1], red_relative[:, 0])
+#         red_radii = np.linalg.norm(red_relative, axis=1)
         
-        ax3.scatter(red_angles, red_radii, c='red', alpha=0.5, s=2)
-        ax3.set_xlabel('Angle (radians)')
-        ax3.set_ylabel('Distance from gray centroid')
-        ax3.set_title('Red Points in Polar Coordinates\n(relative to gray centroid)')
-        ax3.grid(True, alpha=0.3)
+#         ax3.scatter(red_angles, red_radii, c='red', alpha=0.5, s=2)
+#         ax3.set_xlabel('Angle (radians)')
+#         ax3.set_ylabel('Distance from gray centroid')
+#         ax3.set_title('Red Points in Polar Coordinates\n(relative to gray centroid)')
+#         ax3.grid(True, alpha=0.3)
     
-    # Plot 4: First few principal components
-    if n_components >= 3:
-        pca_more = PCA(n_components=min(10, autoencoder_acts.shape[1]), random_state=random_state)
-        latents_more = pca_more.fit_transform(autoencoder_acts_np)
-        ax4.bar(range(min(10, len(pca_more.explained_variance_ratio_))), 
-               pca_more.explained_variance_ratio_[:min(10, len(pca_more.explained_variance_ratio_))])
-        ax4.set_xlabel('Principal Component')
-        ax4.set_ylabel('Explained Variance Ratio')
-        ax4.set_title('Explained Variance by Component')
-        ax4.grid(True, alpha=0.3)
-    else:
-        ax4.text(0.5, 0.5, 'Need more components\nfor this analysis', 
-                ha='center', va='center', transform=ax4.transAxes)
-        ax4.set_title('Component Analysis')
+#     # Plot 4: First few principal components
+#     if n_components >= 3:
+#         pca_more = PCA(n_components=min(10, autoencoder_acts.shape[1]), random_state=random_state)
+#         latents_more = pca_more.fit_transform(autoencoder_acts_np)
+#         ax4.bar(range(min(10, len(pca_more.explained_variance_ratio_))), 
+#                pca_more.explained_variance_ratio_[:min(10, len(pca_more.explained_variance_ratio_))])
+#         ax4.set_xlabel('Principal Component')
+#         ax4.set_ylabel('Explained Variance Ratio')
+#         ax4.set_title('Explained Variance by Component')
+#         ax4.grid(True, alpha=0.3)
+#     else:
+#         ax4.text(0.5, 0.5, 'Need more components\nfor this analysis', 
+#                 ha='center', va='center', transform=ax4.transAxes)
+#         ax4.set_title('Component Analysis')
     
-    plt.tight_layout()
+#     plt.tight_layout()
     
-    # Save plot
-    print("Saving plot...")
-    output_file = f'{output_prefix}_pca_analysis.png'
-    plt.savefig(output_file, dpi=300, bbox_inches='tight')
-    plt.close()
-    print(f"Saved PCA analysis to {output_file}")
+#     # Save plot
+#     print("Saving plot...")
+#     output_file = f'{output_prefix}_pca_analysis.png'
+#     plt.savefig(output_file, dpi=300, bbox_inches='tight')
+#     plt.close()
+#     print(f"Saved PCA analysis to {output_file}")
     
-    # Clean up
-    print("Cleaning up...")
-    torch.cuda.empty_cache()
+#     # Clean up
+#     print("Cleaning up...")
+#     torch.cuda.empty_cache()
     
-    return latents_2d, {
-        'explained_variance_ratio': explained_var,
-        'red_distances_from_gray': red_distances_from_gray,
-        'gray_distances_from_all': gray_distances_from_all,
-        'shell_coefficient': shell_coefficient,
-        'centroids': {
-            'all': all_centroid,
-            'gray': gray_centroid,
-            'red': red_centroid
-        }
-    }
+#     return latents_2d, {
+#         'explained_variance_ratio': explained_var,
+#         'red_distances_from_gray': red_distances_from_gray,
+#         'gray_distances_from_all': gray_distances_from_all,
+#         'shell_coefficient': shell_coefficient,
+#         'centroids': {
+#             'all': all_centroid,
+#             'gray': gray_centroid,
+#             'red': red_centroid
+#         }
+#     }
 
-def run_tsne_analysis(model, autoencoder, data_loader_train, device, args, image_modality_id, output_prefix, perplexity, n_iter, random_state):
-    print(f"Data loader created: {type(data_loader_train)}")
+# def run_tsne_analysis(model, autoencoder, data_loader_train, device, args, image_modality_id, output_prefix, perplexity, n_iter, random_state):
+#     print(f"Data loader created: {type(data_loader_train)}")
     
-    # Try to get a single batch to test the data loader
-    print("\nTesting data loader with a single batch...")
-    try:
-        test_batch = next(iter(data_loader_train))
-        print("Successfully got first batch!")
-        print(f"Batch keys: {list(test_batch.keys())}")
-        for mod, d in test_batch.items():
-            print(f"Modality {mod} tensor shape: {d['tensor'].shape}")
-    except Exception as e:
-        print(f"Error getting first batch: {str(e)}")
-        print(f"Traceback:\n{traceback.format_exc()}")
-        raise
+#     # Try to get a single batch to test the data loader
+#     print("\nTesting data loader with a single batch...")
+#     try:
+#         test_batch = next(iter(data_loader_train))
+#         print("Successfully got first batch!")
+#         print(f"Batch keys: {list(test_batch.keys())}")
+#         for mod, d in test_batch.items():
+#             print(f"Modality {mod} tensor shape: {d['tensor'].shape}")
+#     except Exception as e:
+#         print(f"Error getting first batch: {str(e)}")
+#         print(f"Traceback:\n{traceback.format_exc()}")
+#         raise
     
-    print("\nStarting activation collection...")
-    try:
-        # Collect activations and modality labels
-        activations_tensor_flat, modality_labels_flat, examples_processed = collect_activations_batched_encoder(
-            model, data_loader_train, device, args
-        )
-        print("Finished collecting activations!")
+#     print("\nStarting activation collection...")
+#     try:
+#         # Collect activations and modality labels
+#         activations_tensor_flat, modality_labels_flat, examples_processed = collect_activations_batched_encoder(
+#             model, data_loader_train, device, args
+#         )
+#         print("Finished collecting activations!")
         
-        # Save activations immediately
-        print("\nSaving activations...")
-        save_path = f'/mnt/home/rzhang/ceph/activations_{examples_processed}examples.pt'
-        torch.save({
-            'activations': activations_tensor_flat,
-            'modality_labels': modality_labels_flat,
-            'examples_processed': examples_processed
-        }, save_path)
-        print(f"Saved activations to {save_path}")
+#         # Save activations immediately
+#         print("\nSaving activations...")
+#         save_path = f'/mnt/home/rzhang/ceph/activations_{examples_processed}examples.pt'
+#         torch.save({
+#             'activations': activations_tensor_flat,
+#             'modality_labels': modality_labels_flat,
+#             'examples_processed': examples_processed
+#         }, save_path)
+#         print(f"Saved activations to {save_path}")
         
-        # Clear data loader and CUDA cache
-        del data_loader_train
-        torch.cuda.empty_cache()
+#         # Clear data loader and CUDA cache
+#         del data_loader_train
+#         torch.cuda.empty_cache()
         
-        # Run TSNE visualization
-        print("\nStarting TSNE visualization...")
-        latents_2d = plot_tsne_visualization(
-            activations_tensor_flat,
-            modality_labels_flat,
-            autoencoder,
-            device,
-            image_modality_id=18665,
-            output_prefix='image_tsne',
-            perplexity=30,
-            n_iter=1000,
-            random_state=42
-        )
-        print("Finished TSNE visualization!")
+#         # Run TSNE visualization
+#         print("\nStarting TSNE visualization...")
+#         latents_2d = plot_tsne_visualization(
+#             activations_tensor_flat,
+#             modality_labels_flat,
+#             autoencoder,
+#             device,
+#             image_modality_id=18665,
+#             output_prefix='image_tsne',
+#             perplexity=30,
+#             n_iter=1000,
+#             random_state=42
+#         )
+#         print("Finished TSNE visualization!")
         
-    except Exception as e:
-        print(f"Error during processing: {str(e)}")
-        print(f"Traceback:\n{traceback.format_exc()}")
-    finally:
-        # Clean up
-        if 'data_loader_train' in locals():
-            del data_loader_train
-        torch.cuda.empty_cache()
-        print("\nCleanup completed")
+#     except Exception as e:
+#         print(f"Error during processing: {str(e)}")
+#         print(f"Traceback:\n{traceback.format_exc()}")
+#     finally:
+#         # Clean up
+#         if 'data_loader_train' in locals():
+#             del data_loader_train
+#         torch.cuda.empty_cache()
+#         print("\nCleanup completed")
 
-def run_pca_analysis(model, autoencoder, data_loader, device, args, 
-                    image_modality_id=18665, output_prefix='tok_image',
-                    n_components=2, standardize=True, random_state=42):
-    """
-    Run complete PCA analysis pipeline: collect activations, save them, and create visualization.
+# def run_pca_analysis(model, autoencoder, data_loader, device, args, 
+#                     image_modality_id=18665, output_prefix='tok_image',
+#                     n_components=2, standardize=True, random_state=42):
+#     """
+#     Run complete PCA analysis pipeline: collect activations, save them, and create visualization.
     
-    Args:
-        model: AION model
-        autoencoder: Trained sparse autoencoder
-        data_loader: Data loader for collecting activations
-        device: Device to run computations on
-        args: Arguments object containing batch size and other parameters
-        image_modality_id: ID for image modality tokens
-        output_prefix: Prefix for output files
-        n_components: Number of PCA components
-        standardize: Whether to standardize features before PCA
-        random_state: Random seed for reproducibility
+#     Args:
+#         model: AION model
+#         autoencoder: Trained sparse autoencoder
+#         data_loader: Data loader for collecting activations
+#         device: Device to run computations on
+#         args: Arguments object containing batch size and other parameters
+#         image_modality_id: ID for image modality tokens
+#         output_prefix: Prefix for output files
+#         n_components: Number of PCA components
+#         standardize: Whether to standardize features before PCA
+#         random_state: Random seed for reproducibility
     
-    Returns:
-        dict: Results including PCA latents, statistics, and examples processed
-    """
-    try:
-        print("\n=== Starting PCA Analysis Pipeline ===")
+#     Returns:
+#         dict: Results including PCA latents, statistics, and examples processed
+#     """
+#     try:
+#         print("\n=== Starting PCA Analysis Pipeline ===")
         
-        # Collect activations
-        print("\nCollecting activations...")
-        activations_tensor_flat, modality_labels_flat, examples_processed = collect_activations_batched_encoder(
-            model, data_loader, device, args
-        )
-        print("Finished collecting activations!")
+#         # Collect activations
+#         print("\nCollecting activations...")
+#         activations_tensor_flat, modality_labels_flat, examples_processed = collect_activations_batched_encoder(
+#             model, data_loader, device, args
+#         )
+#         print("Finished collecting activations!")
         
-        # Save activations
-        print("\nSaving activations...")
-        save_path = f'/mnt/home/rzhang/ceph/activations_{examples_processed}examples.pt'
-        torch.save({
-            'activations': activations_tensor_flat,
-            'modality_labels': modality_labels_flat,
-            'examples_processed': examples_processed
-        }, save_path)
-        print(f"Saved activations to {save_path}")
+#         # Save activations
+#         print("\nSaving activations...")
+#         save_path = f'/mnt/home/rzhang/ceph/activations_{examples_processed}examples.pt'
+#         torch.save({
+#             'activations': activations_tensor_flat,
+#             'modality_labels': modality_labels_flat,
+#             'examples_processed': examples_processed
+#         }, save_path)
+#         print(f"Saved activations to {save_path}")
         
-        # Clear data loader and CUDA cache
-        del data_loader
-        torch.cuda.empty_cache()
+#         # Clear data loader and CUDA cache
+#         del data_loader
+#         torch.cuda.empty_cache()
         
-        # Run PCA visualization
-        print("\nStarting PCA visualization...")
-        pca_latents, pca_stats = plot_pca_visualization(
-            activations_tensor_flat,
-            modality_labels_flat,
-            autoencoder,
-            device,
-            image_modality_id=image_modality_id,
-            output_prefix=output_prefix,
-            n_components=n_components,
-            standardize=standardize,
-            random_state=random_state
-        )
-        print("Finished PCA visualization!")
+#         # Run PCA visualization
+#         print("\nStarting PCA visualization...")
+#         pca_latents, pca_stats = plot_pca_visualization(
+#             activations_tensor_flat,
+#             modality_labels_flat,
+#             autoencoder,
+#             device,
+#             image_modality_id=image_modality_id,
+#             output_prefix=output_prefix,
+#             n_components=n_components,
+#             standardize=standardize,
+#             random_state=random_state
+#         )
+#         print("Finished PCA visualization!")
         
-        return {
-            'pca_latents': pca_latents,
-            'pca_stats': pca_stats,
-            'examples_processed': examples_processed
-        }
+#         return {
+#             'pca_latents': pca_latents,
+#             'pca_stats': pca_stats,
+#             'examples_processed': examples_processed
+#         }
         
-    except Exception as e:
-        print(f"\nError during PCA analysis: {str(e)}")
-        print(f"Traceback:\n{traceback.format_exc()}")
-        return None
+#     except Exception as e:
+#         print(f"\nError during PCA analysis: {str(e)}")
+#         print(f"Traceback:\n{traceback.format_exc()}")
+#         return None
         
-    finally:
-        # Clean up
-        if 'data_loader' in locals():
-            del data_loader
-        torch.cuda.empty_cache()
-        print("\nCleanup completed")
+#     finally:
+#         # Clean up
+#         if 'data_loader' in locals():
+#             del data_loader
+#         torch.cuda.empty_cache()
+#         print("\nCleanup completed")
+
+
 
 if __name__ == '__main__':
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-
     # Load model with trained parameters
     print("\n=== Loading Model ===")
-    model = AION.from_pretrained('/mnt/ceph/users/polymathic/aion/dec24/base')
-    print(f"Model loaded from pretrained weights")
+    try:
+        # Try the full HuggingFace identifier first
+        model = AION.from_pretrained('polymathic-ai/aion-base').to(device).eval()
+        print(f"Model loaded from HuggingFace: polymathic-ai/aion-base")
+    except Exception as e:
+        print(f"Failed to load from HuggingFace: {e}")
+        # print("Attempting to load from local path...")
+        # try:
+        #     # Fallback to local path as seen in save_activations.py
+        #     model = AION.from_pretrained('/mnt/ceph/users/polymathic/aion/dec24/base').to(device).eval()
+        #     print(f"Model loaded from local path: /mnt/ceph/users/polymathic/aion/dec24/base")
+        # except Exception as e2:
+        #     print(f"Failed to load from local path: {e2}")
+        #     raise e2
+    
     model.freeze_encoder()
     model.freeze_decoder()
-    model = model.to(device).eval()  
     print(f"Model architecture:\n{model}")
     
-    # Find the correct image modality ID dynamically
-    image_modality_name = None
-    image_modality_id = None
-    for mod_name, mod_info in model.modality_info.items():
-        if 'image' in mod_name.lower() or 'tok_image' in mod_name:
-            image_modality_name = mod_name
-            image_modality_id = mod_info['id']
-            break
+    # # Find the correct image modality ID dynamically
+    # image_modality_name = None
+    # image_modality_id = None
+    # for mod_name, mod_info in model.modality_info.items():
+    #     if 'image' in mod_name.lower() or 'tok_image' in mod_name:
+    #         image_modality_name = mod_name
+    #         image_modality_id = mod_info['id']
+    #         break
     
-    if image_modality_id is not None:
-        print(f"Found image modality: {image_modality_name} with ID: {image_modality_id}")
-    else:
-        print("Warning: Could not find image modality automatically")
-        # Fallback to manual specification
-        image_modality_id = 18665
-        print(f"Using fallback image modality ID: {image_modality_id}")
-    print()
+    # if image_modality_id is not None:
+    #     print(f"Found image modality: {image_modality_name} with ID: {image_modality_id}")
+    # else:
+    #     print("Warning: Could not find image modality automatically")
+    #     # Fallback to manual specification
+    #     image_modality_id = 18665
+    #     print(f"Using fallback image modality ID: {image_modality_id}")
+    # print()
 
     # Load the sparse autoencoder
     input_size = 768
@@ -1829,38 +1849,38 @@ if __name__ == '__main__':
     # # Plot activation frequencies comparison
     # transformer_frequencies, autoencoder_frequencies = plot_activation_frequencies_comparison(activations_tensor_flat, autoencoder, device)
     
-    # Collect activations and modality labels for transformer probing
-    print("\n=== Collecting activations for transformer neuron probing ===")
-    # activations_tensor_flat, modality_labels_flat, examples_processed = collect_activations_batched_encoder(
-    #     model, data_loader_train, device, args)
-    activations_tensor_flat, modality_labels_flat, examples_processed = collect_activations_batched_decoder(
-        model, data_loader_train, device, args
-    )
+    # # Collect activations and modality labels for transformer probing
+    # print("\n=== Collecting activations for transformer neuron probing ===")
+    # # activations_tensor_flat, modality_labels_flat, examples_processed = collect_activations_batched_encoder(
+    # #     model, data_loader_train, device, args)
+    # activations_tensor_flat, modality_labels_flat, examples_processed = collect_activations_batched_decoder(
+    #     model, data_loader_train, device, args
+    # )
     
     # # Apply the dense probe on ALL transformer neurons simultaneously  
     # apply_dense_probe_transformer(
     #     activations_tensor_flat, 
     #     modality_labels_flat, 
     #     examples_processed,
-    #     image_modality_id=image_modality_id,  # Use the dynamically found modality ID
-    #     # output_prefix = 'image_encoder_dense'
+    #     image_modality_id=image_modality_id,
+    #     # output_prefix = 'image_encoder_dense',
     #     output_prefix='image_decoder_dense',  
     #     test_size=0.2,
     #     random_state=42
     # )
 
-    # Apply the logistic probe on each latent dimension  
-    apply_logistic_probe(
-        activations_tensor_flat, 
-        modality_labels_flat, 
-        examples_processed, 
-        autoencoder, 
-        device,
-        image_modality_id=18665,  # ID for tok_image
-        output_prefix='image_decoder_sae',  # Prefix for output files
-        test_size=0.2,
-        random_state=42
-    )
+    # # Apply the logistic probe on each latent dimension  
+    # apply_logistic_probe(
+    #     activations_tensor_flat, 
+    #     modality_labels_flat, 
+    #     examples_processed, 
+    #     autoencoder, 
+    #     device,
+    #     image_modality_id=image_modality_id,  
+    #     output_prefix='image_decoder_sae',  
+    #     test_size=0.2,
+    #     random_state=42
+    # )
 
     # # Run PCA analysis
     # run_pca_analysis(
@@ -1890,5 +1910,31 @@ if __name__ == '__main__':
     #     random_state=42
     # )
 
+    # topk_df = top_k_inputs_for_sae_latent_neuron_n(
+    #     autoencoder,
+    #     latent_neuron_n=0,
+    #     k=10,
+    #     activations_tensor_flat=activations_tensor_flat,
+    #     modality_labels_flat=modality_labels_flat,
+    #     model=model
+    # )
 
+    activations_flat, modality_labels_flat, sample_mapping, decoder_tokens_cache, original_batch_cache = collect_activations_with_raw_data_mapping(
+        model, data_loader_train, device, args)
 
+    # Run the top-k attribution using the exact decoder tokens for detokenization.
+    df = top_k_inputs_for_sae_latent_neuron_n(
+        sae=autoencoder,
+        activations_tensor_flat=activations_flat,
+        modality_labels_flat=modality_labels_flat,
+        latent_neuron_n=0,
+        k=10,
+        batch_size=8192,
+        sample_mapping=sample_mapping,
+        decoder_tokens_cache=decoder_tokens_cache,
+        original_batch_cache=original_batch_cache,
+        model=model,
+        save_dir="latent_topk_visualizations",
+        filename_prefix="",
+        create_plots=True,
+    )
