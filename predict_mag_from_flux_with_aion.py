@@ -10,19 +10,12 @@ print("huggingface_hub version:", huggingface_hub.__version__)
 from aion import AION
 from aion.codecs import CodecManager
 from aion.modalities import LegacySurveyFluxG, HSCMagG
-# from sparse_autoencoder import SparseAutoencoder
 
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
 # 1. Model and CodecManager setup
 model = AION.from_pretrained('polymathic-ai/aion-base').to(device).eval()
 codec_manager = CodecManager(device=device)
-
-# # Register a forward hook on the 8th decoder block to collect activations
-# activations = []
-# def _hook(module, input, output):
-#     activations.append(output.detach().cpu())
-# hook_handle = model.decoder[8].register_forward_hook(_hook)
 
 # 2. Load test flux data (nanomaggies)
 flux_g_data = torch.load('AION/tests/test_data/FLUX_G_codec_input_batch.pt')
@@ -267,17 +260,3 @@ if len(nan_indices) > 0:
             print(f"  [{j:3d}]: {codebook_np[j]:.6f}{marker}")
 
 print("\n" + "="*50) 
-
-
-# # Load the sparse autoencoder
-# input_size = 768
-# hidden_size = input_size*4
-# k = max(1, int(hidden_size * 0.02))  # Use 2% sparsity by default
-# autoencoder = SparseAutoencoder(input_size, hidden_size).to(device)
-# autoencoder.load_state_dict(torch.load('best_llm_sae_rural-wood-16.pth', weights_only=True, map_location=device))  
-# autoencoder.eval()
-# print(f"Autoencoder loaded")
-
-# # At the end, remove the hook to avoid memory leaks
-# hook_handle.remove()
-
