@@ -17,6 +17,7 @@ from aion.modalities import (
 )
 from sparse_autoencoder import SparseAutoencoder
 from scipy.stats import pearsonr, spearmanr
+from predict_flux_from_image import load_legacysurvey_data
 
 def load_image_data(path: str, device: torch.device) -> torch.Tensor:
     """Load and preprocess the image data."""
@@ -97,6 +98,7 @@ def get_aion_activations_and_flux_predictions(
     image_tensor: torch.Tensor,
     model: AION,
     codec_manager: CodecManager,
+    bands: list,
     block_idx: int = 8,
     batch_size: int = 32,
     save_path: Optional[str] = None
@@ -107,7 +109,6 @@ def get_aion_activations_and_flux_predictions(
     Returns (activations, predicted_fluxes) as numpy arrays.
     """
     activations = []
-    bands = ["DES-G", "DES-R", "DES-I", "DES-Z"]
     
     # Define target modalities
     target_modalities = {
@@ -326,11 +327,18 @@ def probe_latent_flux_correlation(
         for r in top_10_pearson_log:
             print(f" Latent {r['latent_idx']}: Pearson_log={r['pearson_log']:.4f}, Pearson_raw={r['pearson_raw']:.4f}, Spearman_raw={r['spearman_raw']:.4f}")
         
+        # Print top 10 by pearson_raw
+        print(f"\nTop 10 by Pearson correlation with raw {band_label} band flux:")
+        top_10_pearson_raw = sorted(valid_results, key=lambda x: abs(x['pearson_raw']), reverse=True)[:10]
+        for r in top_10_pearson_raw:
+            print(f" Latent {r['latent_idx']}: Pearson_raw={r['pearson_raw']:.4f}, Pearson_log={r['pearson_log']:.4f}, Spearman_raw={r['spearman_raw']:.4f}")
+        
         all_corrs = [abs(r['pearson_log']) for r in valid_results]
         print(f"Correlation stats for {band_label} band (valid only): min={np.min(all_corrs):.4f}, max={np.max(all_corrs):.4f}, mean={np.mean(all_corrs):.4f}")
         
         # Plot for this band
         if plot and len(valid_results) > 0:
+            # Plot top k latents based on pearson_log
             for j in range(actual_top_k):
                 idx = results_sorted[j]['latent_idx']
                 
@@ -354,6 +362,31 @@ def probe_latent_flux_correlation(
                     plt.savefig(f"{save_prefix}_latent{idx}_vs_{band_label}flux_both.png")
                 plt.show()
             
+            # Plot top k latents based on pearson_raw
+            results_sorted_raw = sorted(valid_results, key=lambda x: abs(x['pearson_raw']), reverse=True)
+            for j in range(actual_top_k):
+                idx = results_sorted_raw[j]['latent_idx']
+                
+                # Plot raw flux vs latent
+                plt.figure(figsize=(12, 4))
+                
+                plt.subplot(1, 2, 1)
+                plt.scatter(flux_pos, latents_pos[:, idx], alpha=0.5)
+                plt.xlabel(f'{band_label} band flux (nanomaggies)')
+                plt.ylabel(f'Latent {idx}')
+                plt.title(f'Latent {idx} vs raw {band_label} band flux\nPearson: {results_sorted_raw[j]["pearson_raw"]:.3f}')
+                
+                plt.subplot(1, 2, 2)
+                plt.scatter(log_flux, latents_pos[:, idx], alpha=0.5)
+                plt.xlabel(f'log10({band_label} band flux)')
+                plt.ylabel(f'Latent {idx}')
+                plt.title(f'Latent {idx} vs log10({band_label} band flux)\nPearson: {results_sorted_raw[j]["pearson_log"]:.3f}')
+                
+                plt.tight_layout()
+                if save_prefix is not None:
+                    plt.savefig(f"{save_prefix}_latent{idx}_vs_{band_label}flux_both_raw.png")
+                plt.show()
+            
             # Add scatter plot of all latent neurons vs. their absolute Pearson correlation with log(flux)
             plt.figure(figsize=(10, 4))
             abs_corrs = [abs(r['pearson_log']) for r in results]
@@ -363,6 +396,54 @@ def probe_latent_flux_correlation(
             plt.title(f'Latent Neuron vs. log10({band_label} band flux) Correlation (Scatter)')
             if save_prefix is not None:
                 plt.savefig(f"{save_prefix}_all_latents_{band_label}flux_scatter.png")
+            plt.show()
+            
+            # Add histogram plots showing distribution of correlation values for both raw and log
+            plt.figure(figsize=(16, 6))
+            
+            # Get correlation values from already-filtered valid_results
+            raw_corrs = [r['pearson_raw'] for r in valid_results]
+            log_corrs = [r['pearson_log'] for r in valid_results]
+            
+            # Create histogram for raw correlations
+            plt.subplot(1, 2, 1)
+            plt.hist(raw_corrs, bins=30, alpha=0.7, edgecolor='black')
+            plt.xlabel(f'Pearson Correlation with raw {band_label} band flux')
+            plt.ylabel('Number of Latent Neurons')
+            plt.title(f'Distribution of Raw Correlation Values\n{band_label} Band')
+            plt.axvline(x=0, color='red', linestyle='--', alpha=0.7, label='Zero correlation')
+            plt.legend()
+            
+            # Add statistics text for raw correlations
+            pos_corrs_raw = [c for c in raw_corrs if c > 0]
+            neg_corrs_raw = [c for c in raw_corrs if c < 0]
+            mean_raw = np.mean(raw_corrs) if raw_corrs else 0
+            std_raw = np.std(raw_corrs) if raw_corrs else 0
+            plt.text(0.02, 0.98, f'Positive correlations: {len(pos_corrs_raw)} ({len(pos_corrs_raw)/len(raw_corrs)*100:.1f}%)\nNegative correlations: {len(neg_corrs_raw)} ({len(neg_corrs_raw)/len(raw_corrs)*100:.1f}%)\nMean: {mean_raw:.3f}\nStd: {std_raw:.3f}', 
+                     transform=plt.gca().transAxes, verticalalignment='top',
+                     bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.8))
+            
+            # Create histogram for log correlations
+            plt.subplot(1, 2, 2)
+            plt.hist(log_corrs, bins=30, alpha=0.7, edgecolor='black')
+            plt.xlabel(f'Pearson Correlation with log10({band_label} band flux)')
+            plt.ylabel('Number of Latent Neurons')
+            plt.title(f'Distribution of Log Correlation Values\n{band_label} Band')
+            plt.axvline(x=0, color='red', linestyle='--', alpha=0.7, label='Zero correlation')
+            plt.legend()
+            
+            # Add statistics text for log correlations
+            pos_corrs_log = [c for c in log_corrs if c > 0]
+            neg_corrs_log = [c for c in log_corrs if c < 0]
+            mean_log = np.mean(log_corrs) if log_corrs else 0
+            std_log = np.std(log_corrs) if log_corrs else 0
+            plt.text(0.02, 0.98, f'Positive correlations: {len(pos_corrs_log)} ({len(pos_corrs_log)/len(log_corrs)*100:.1f}%)\nNegative correlations: {len(neg_corrs_log)} ({len(neg_corrs_log)/len(log_corrs)*100:.1f}%)\nMean: {mean_log:.3f}\nStd: {std_log:.3f}', 
+                     transform=plt.gca().transAxes, verticalalignment='top',
+                     bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.8))
+            
+            plt.tight_layout()
+            if save_prefix is not None:
+                plt.savefig(f"{save_prefix}_all_latents_{band_label}flux_histograms.png")
             plt.show()
     
     return all_results
@@ -387,8 +468,15 @@ def main(
     model = AION.from_pretrained('polymathic-ai/aion-base').to(device).eval()
     codec_manager = CodecManager(device=device)
     
-    # Load image data
-    image_tensor = load_image_data(image_path, device)
+    # Load larger dataset from predict_flux_from_image.py
+    print("Loading larger dataset...")
+    data_path = '/mnt/home/polymathic/ceph/MultimodalUniverse/legacysurvey/dr10_south_21/healpix=299/001-of-001.hdf5'
+    data = load_legacysurvey_data(data_path, max_samples=200)
+    
+    # Convert images to tensor and move to device
+    image_tensor = torch.tensor(data['images'], dtype=torch.float32).to(device)
+    print(f"Image tensor shape: {image_tensor.shape}")
+    print(f"Image value range: {image_tensor.min():.6f} to {image_tensor.max():.6f}")
     print(f"Image data checksum: {torch.sum(image_tensor).item()}")
     
     # Get AION activations and flux predictions from images
@@ -410,7 +498,7 @@ def main(
             print(f"{band} checksum: {np.sum(flux)}")
     else:
         activations_np_flat, predicted_fluxes_repeated = get_aion_activations_and_flux_predictions(
-            image_tensor, model, codec_manager, block_idx=block_idx, batch_size=batch_size, save_path=activations_path)
+            image_tensor, model, codec_manager, data['bands'], block_idx=block_idx, batch_size=batch_size, save_path=activations_path)
         print(f"Generated activations checksum: {np.sum(activations_np_flat)}")
         for band, flux in predicted_fluxes_repeated.items():
             print(f"Generated {band} checksum: {np.sum(flux)}")
