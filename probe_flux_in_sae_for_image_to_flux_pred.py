@@ -674,6 +674,7 @@ def probe(sae_weights_path='best_llm_sae_rural-wood-16.pth',
     
     print(f"\nSaved results to {save_dir}")
 
+
 def intervention_experiment(sae_weights_path='best_llm_sae_rural-wood-16.pth',
     save_dir='intervention_results',
     batch_size=32,
@@ -681,6 +682,10 @@ def intervention_experiment(sae_weights_path='best_llm_sae_rural-wood-16.pth',
     target_latent=2023,
     device=None
 ):
+    # Set random seeds for reproducibility (same as probe function)
+    torch.manual_seed(42)
+    np.random.seed(42)
+    
     # 1. SETUP - Use existing probe function to load everything
     if device is None:
         device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -742,19 +747,34 @@ def intervention_experiment(sae_weights_path='best_llm_sae_rural-wood-16.pth',
     
     feature_decoder_vector = sae_model.decoder.weight[:, target_latent]  # Shape: (768,)    
     print(f"Feature decoder vector shape: {feature_decoder_vector.shape}")
+    print(f"Feature decoder vector norm: {torch.norm(feature_decoder_vector).item():.6f}")
     
-    # 4. DEFINE THE INTERVENTION HOOK
-    def create_steering_hook(amp_factor, decoder_vector):
-        """Create a steering hook with captured amplification factor and decoder vector."""
+    # 4. DEFINE THE INTERVENTION HOOK WITH ACTIVATION TRACKING
+    def create_steering_hook_with_tracking(amp_factor, decoder_vector):
+        """Create a steering hook that tracks both original and intervened activations."""
+        # Storage for activation analysis
+        original_activations = []
+        intervened_activations = []
+        
         def steering_hook(module, input, output):
-            # module and input are required by PyTorch's hook signature but not used
-            # output shape could be (batch_size, seq_len, 768) or (batch_size, 768)
+            # Use the original tensor for computation (like the working version)
             original_activation = output
+            
+            # Store original activation for analysis (detached copy)
+            original_activations.append(original_activation.detach().cpu())
             
             # Add the amplified feature direction
             modified_activation = original_activation + amp_factor * decoder_vector
             
+            # Store intervened activation for analysis (detached copy)
+            intervened_activations.append(modified_activation.detach().cpu())
+            
             return modified_activation
+        
+        # Attach storage to the hook function for later access
+        steering_hook.original_activations = original_activations
+        steering_hook.intervened_activations = intervened_activations
+        
         return steering_hook
     
     # 5. RUN INTERVENTION EXPERIMENT
@@ -762,12 +782,13 @@ def intervention_experiment(sae_weights_path='best_llm_sae_rural-wood-16.pth',
     
     # Store results for plotting
     all_results = {}
+    activation_analysis = {}  # Store activation similarity metrics
     
     for amp_factor in amplification_factors:
         print(f"\n=== Testing amplification factor: {amp_factor} ===")
         
         # Create the hook with the current amplification factor
-        hook_fn = create_steering_hook(amp_factor, feature_decoder_vector)
+        hook_fn = create_steering_hook_with_tracking(amp_factor, feature_decoder_vector)
         
         # Register hook on the AION decoder block where SAE was trained
         handle = model.decoder[block_idx].register_forward_hook(hook_fn)
@@ -829,6 +850,47 @@ def intervention_experiment(sae_weights_path='best_llm_sae_rural-wood-16.pth',
             # Store results
             all_results[amp_factor] = intervened_flux_predictions
             
+            # ACTIVATION ANALYSIS - Compute cosine similarity and norm differences
+            if len(hook_fn.original_activations) > 0 and len(hook_fn.intervened_activations) > 0:
+                # Concatenate all activations from all batches
+                orig_acts = torch.cat(hook_fn.original_activations, dim=0)  # [total_samples, seq_len, hidden_dim]
+                inter_acts = torch.cat(hook_fn.intervened_activations, dim=0)  # [total_samples, seq_len, hidden_dim]
+                
+                # Flatten to [total_samples * seq_len, hidden_dim] for analysis
+                orig_acts_flat = orig_acts.view(-1, orig_acts.shape[-1])  # [N, hidden_dim]
+                inter_acts_flat = inter_acts.view(-1, inter_acts.shape[-1])  # [N, hidden_dim]
+                
+                # Compute cosine similarities
+                cosine_sims = torch.nn.functional.cosine_similarity(orig_acts_flat, inter_acts_flat, dim=1)
+                mean_cosine_sim = cosine_sims.mean().item()
+                std_cosine_sim = cosine_sims.std().item()
+                
+                # Compute norm differences
+                orig_norms = torch.norm(orig_acts_flat, dim=1)
+                inter_norms = torch.norm(inter_acts_flat, dim=1)
+                norm_diffs = (inter_norms - orig_norms).abs()
+                mean_norm_diff = norm_diffs.mean().item()
+                std_norm_diff = norm_diffs.std().item()
+                
+                # Compute relative norm change
+                relative_norm_change = (norm_diffs / (orig_norms + 1e-8)).mean().item()
+                
+                activation_analysis[amp_factor] = {
+                    'mean_cosine_sim': mean_cosine_sim,
+                    'std_cosine_sim': std_cosine_sim,
+                    'mean_norm_diff': mean_norm_diff,
+                    'std_norm_diff': std_norm_diff,
+                    'relative_norm_change': relative_norm_change,
+                    'mean_orig_norm': orig_norms.mean().item(),
+                    'mean_inter_norm': inter_norms.mean().item()
+                }
+                
+                print(f"Activation Analysis for amp={amp_factor}:")
+                print(f"  Mean cosine similarity: {mean_cosine_sim:.4f} ± {std_cosine_sim:.4f}")
+                print(f"  Mean norm difference: {mean_norm_diff:.4f} ± {std_norm_diff:.4f}")
+                print(f"  Relative norm change: {relative_norm_change:.4f}")
+                print(f"  Original norm: {orig_norms.mean().item():.4f}, Intervened norm: {inter_norms.mean().item():.4f}")
+            
             # Compare predictions
             for band in ['flux_g', 'flux_r', 'flux_i', 'flux_z']:
                 baseline_flux = baseline_flux_predictions[band]
@@ -850,7 +912,72 @@ def intervention_experiment(sae_weights_path='best_llm_sae_rural-wood-16.pth',
             # Always remove the hook
             handle.remove()
     
-    # 6. VALIDATION TESTS (as your advisor suggested)
+    # 6. PLOT ACTIVATION ANALYSIS
+    print("\n=== Creating Activation Analysis Plots ===")
+    
+    # Extract metrics for plotting
+    amp_factors_for_plot = [amp for amp in amplification_factors if amp in activation_analysis]
+    cosine_sims = [activation_analysis[amp]['mean_cosine_sim'] for amp in amp_factors_for_plot]
+    cosine_stds = [activation_analysis[amp]['std_cosine_sim'] for amp in amp_factors_for_plot]
+    norm_diffs = [activation_analysis[amp]['mean_norm_diff'] for amp in amp_factors_for_plot]
+    norm_stds = [activation_analysis[amp]['std_norm_diff'] for amp in amp_factors_for_plot]
+    rel_norm_changes = [activation_analysis[amp]['relative_norm_change'] for amp in amp_factors_for_plot]
+    
+    # Create activation analysis plots
+    fig, axes = plt.subplots(2, 2, figsize=(15, 10))
+    
+    # Cosine similarity plot
+    axes[0, 0].errorbar(amp_factors_for_plot, cosine_sims, yerr=cosine_stds, 
+                       marker='o', capsize=5, capthick=2, linewidth=2)
+    axes[0, 0].set_xlabel('Amplification Factor')
+    axes[0, 0].set_ylabel('Mean Cosine Similarity')
+    axes[0, 0].set_title('Cosine Similarity: Original vs Intervened Activations')
+    axes[0, 0].grid(True, alpha=0.3)
+    axes[0, 0].set_ylim(0, 1.05)
+    
+    # Add reference lines for cosine similarity
+    axes[0, 0].axhline(y=0.9, color='green', linestyle='--', alpha=0.7, label='High similarity (0.9)')
+    axes[0, 0].axhline(y=0.7, color='orange', linestyle='--', alpha=0.7, label='Moderate similarity (0.7)')
+    axes[0, 0].axhline(y=0.5, color='red', linestyle='--', alpha=0.7, label='Low similarity (0.5)')
+    axes[0, 0].legend(fontsize=8)
+    
+    # Norm difference plot
+    axes[0, 1].errorbar(amp_factors_for_plot, norm_diffs, yerr=norm_stds,
+                       marker='o', capsize=5, capthick=2, linewidth=2)
+    axes[0, 1].set_xlabel('Amplification Factor')
+    axes[0, 1].set_ylabel('Mean Norm Difference')
+    axes[0, 1].set_title('Norm Difference: |norm(intervened) - norm(original)|')
+    axes[0, 1].grid(True, alpha=0.3)
+    
+    # Relative norm change plot
+    axes[1, 0].plot(amp_factors_for_plot, rel_norm_changes, 'o-', linewidth=2, markersize=6)
+    axes[1, 0].set_xlabel('Amplification Factor')
+    axes[1, 0].set_ylabel('Relative Norm Change')
+    axes[1, 0].set_title('Relative Norm Change: |Δnorm| / norm(original)')
+    axes[1, 0].grid(True, alpha=0.3)
+    
+    # Combined plot: Cosine sim vs norm change
+    scatter = axes[1, 1].scatter(cosine_sims, rel_norm_changes, 
+                                c=amp_factors_for_plot, cmap='viridis', s=100)
+    axes[1, 1].set_xlabel('Mean Cosine Similarity')
+    axes[1, 1].set_ylabel('Relative Norm Change')
+    axes[1, 1].set_title('Cosine Similarity vs Norm Change')
+    axes[1, 1].grid(True, alpha=0.3)
+    
+    # Add colorbar
+    cbar = plt.colorbar(scatter, ax=axes[1, 1])
+    cbar.set_label('Amplification Factor')
+    
+    # Add annotations for each point
+    for i, amp in enumerate(amp_factors_for_plot):
+        axes[1, 1].annotate(f'{amp}', (cosine_sims[i], rel_norm_changes[i]), 
+                           xytext=(5, 5), textcoords='offset points', fontsize=8)
+    
+    plt.tight_layout()
+    plt.savefig(os.path.join(save_dir, f'activation_analysis_latent{target_latent}.png'), dpi=300, bbox_inches='tight')
+    plt.show()
+    
+    # 7. VALIDATION TESTS (as your advisor suggested)
     print("\n=== Validation Tests ===")
     
     # Test a=0 is no-op
@@ -865,13 +992,13 @@ def intervention_experiment(sae_weights_path='best_llm_sae_rural-wood-16.pth',
     max_change = np.max(np.abs(all_results[1000.0]['flux_g'] - baseline_flux_predictions['flux_g']))
     print(f"a=1000 creates changes (max change: {max_change:.3f})")
    
-    # 7. PLOT THE PREDICTED VS TRUE COMPARISON
-    print("\n=== Creating plots ===")
+    # 8. PLOT THE PREDICTED VS TRUE COMPARISON
+    print("\n=== Creating flux prediction plots ===")
     
     bands = ['flux_g', 'flux_r', 'flux_i', 'flux_z']
     band_labels = ['G-band', 'R-band', 'I-band', 'Z-band']
     
-    # 8. PLOT THE AMPLIFICATION EFFECT - CREATE SEPARATE PLOTS FOR EACH AMPLIFICATION
+    # 9. PLOT THE AMPLIFICATION EFFECT - CREATE SEPARATE PLOTS FOR EACH AMPLIFICATION
     print("Creating separate plots for each amplification factor...")
     
     for amp_factor in amplification_factors:
@@ -901,7 +1028,7 @@ def intervention_experiment(sae_weights_path='best_llm_sae_rural-wood-16.pth',
         plt.savefig(os.path.join(save_dir, f'intervention_amp{amp_factor}_latent{target_latent}.png'), dpi=300)
         plt.show()
     
-    # 9. PLOT AMPLIFICATION VS MEAN SHIFT
+    # 10. PLOT AMPLIFICATION VS MEAN SHIFT
     plt.figure(figsize=(12, 8))
     
     for i, (band, label) in enumerate(zip(bands, band_labels)):
@@ -940,7 +1067,9 @@ def intervention_experiment(sae_weights_path='best_llm_sae_rural-wood-16.pth',
         'true_flux_data': true_flux_data,
         'baseline_predictions': baseline_flux_predictions,
         'target_latent': target_latent,
-        'block_idx': block_idx
+        'block_idx': block_idx,
+        'activation_analysis': activation_analysis,  # Add activation analysis to saved results
+        'decoder_vector_norm': torch.norm(feature_decoder_vector).item()
     }
     
     np.save(os.path.join(save_dir, f'intervention_results_latent{target_latent}.npy'), results_summary)
