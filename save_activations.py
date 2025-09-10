@@ -30,7 +30,7 @@ class Args:
         self.min_input_tokens = None
         self.min_target_tokens = None
         self.batch_size = 128
-        self.epoch_size = 5000  
+        self.epoch_size = 5000
         self.num_workers = 1
         self.num_tasks = 1
         self.pin_mem = True
@@ -74,32 +74,33 @@ def get_data(args):
     print("\n=== Data Loader Information ===")
     print(f"Number of training steps per epoch: {num_train_steps}")
 
-    # Check the structure of a batch
-    print("\n=== Sample Batch Structure ===")
-    sample_batch = next(iter(data_loader_train))
-    if isinstance(sample_batch, dict):
-        print(f"Batch keys: {list(sample_batch.keys())}")
-        for mod_name, mod_data in sample_batch.items():
-            print(f"\nModality: {mod_name}")
-            for key, value in mod_data.items():
-                if isinstance(value, torch.Tensor):
-                    print(f"  {key} shape: {value.shape}")
-                    print(f"  {key} dtype: {value.dtype}")
-                    print(f"  {key} device: {value.device}")
-                    if key == 'tensor':
-                        if value.numel() > 0:  # Check if tensor is not empty
-                            print(f"  {key} min value: {value.min().item()}")
-                            print(f"  {key} max value: {value.max().item()}")
-                            print(f"  {key} mean value: {value.float().mean().item()}")
-                        else:
-                            print(f"  {key} is empty - skipping min/max/mean calculations")
+    # # Check the structure of a batch
+    # print("\n=== Sample Batch Structure ===")
+    # sample_batch = next(iter(data_loader_train))
+    # if isinstance(sample_batch, dict):
+    #     print(f"Batch keys: {list(sample_batch.keys())}")
+    #     for mod_name, mod_data in sample_batch.items():
+    #         print(f"\nModality: {mod_name}")
+    #         for key, value in mod_data.items():
+    #             if isinstance(value, torch.Tensor):
+    #                 print(f"  {key} shape: {value.shape}")
+    #                 print(f"  {key} dtype: {value.dtype}")
+    #                 print(f"  {key} device: {value.device}")
+    #                 if key == 'tensor':
+    #                     if value.numel() > 0:  # Check if tensor is not empty
+    #                         print(f"  {key} min value: {value.min().item()}")
+    #                         print(f"  {key} max value: {value.max().item()}")
+    #                         print(f"  {key} mean value: {value.float().mean().item()}")
+    #                     else:
+    #                         print(f"  {key} is empty - skipping min/max/mean calculations")
     return data_loader_train
 
-def collect_activations_batched(model, data_loader, device):
+def collect_activations_batched(model, data_loader, device, max_examples_per_file=5000):
     print("\n=== Starting Activation Collection ===")
     activations = []
-    # modality_samples = {} 
     examples_processed = 0
+    file_count = 0
+    saved_files = []
     
     def hook_fn(module, input, output):
         print(f'\nHook received output shape: {output.shape}')
@@ -110,42 +111,32 @@ def collect_activations_batched(model, data_loader, device):
     hook = ninth_decoder_block.register_forward_hook(hook_fn)
     print(f"Registered hook on decoder block 8")
 
-    # # Process a single batch first for detailed analysis
-    # first_batch = next(iter(data_loader))
-    # print("\n=== DETAILED TENSOR ANALYSIS OF FIRST BATCH ===")
-    
-    # # Examine each modality's tensor in detail
-    # for mod, d in first_batch.items():
-    #     tensor = d.get('tensor', None)
-    #     if tensor is not None:
-    #         # Check if tensor contains meaningful data
-    #         if tensor.numel() > 0:
-    #             is_all_zeros = (tensor == 0).all().item()
-    #             is_all_same = (tensor == tensor[0]).all().item()
-    #             has_nan = torch.isnan(tensor).any().item()
-                
-    #             # Stats about tensor
-    #             print(f"\nModality: {mod}")
-    #             print(f"  Shape: {tensor.shape}")
-    #             print(f"  All zeros? {is_all_zeros}")
-    #             print(f"  All same value? {is_all_same}")
-    #             print(f"  Has NaN? {has_nan}")
-                
-    #             # If not all zeros/same, examine a bit more
-    #             if not is_all_zeros and not is_all_same and not has_nan:
-    #                 print(f"  Min: {tensor.min().item()}")
-    #                 print(f"  Max: {tensor.max().item()}")
-    #                 print(f"  Mean: {tensor.float().mean().item()}")
-    #                 print(f"  Std: {tensor.float().std().item()}")
-                    
-    #                 # Count non-zero samples
-    #                 non_zero_count = (tensor.abs().sum(dim=tuple(range(1, tensor.dim()))) > 0).sum().item()
-    #                 print(f"  Non-zero samples: {non_zero_count} / {tensor.shape[0]}")
-                    
-    #                 # This is a modality with real data
-    #                 if non_zero_count > 0:
-    #                     modality_samples[mod] = tensor[0].clone().detach().cpu()  # Save first sample
-    
+    def save_current_activations():
+        nonlocal activations, file_count, saved_files
+        if not activations:
+            return
+        
+        # Concatenate current activations
+        print(f"\nSaving chunk {file_count + 1}...")
+        activations_tensor = torch.cat(activations, dim=0)
+        print(f"Chunk activations shape: {activations_tensor.shape}")
+        
+        # Flatten activations
+        sample_size, seq_length, embed_dim = activations_tensor.shape
+        activations_tensor_flat = activations_tensor.reshape(sample_size * seq_length, embed_dim)
+        print(f"Flattened chunk shape: {activations_tensor_flat.shape}")
+        
+        # Save to file
+        output_file = f'/mnt/home/rzhang/ceph/activations_{activations_tensor_flat.shape[0]}examples_chunk{file_count + 1}.pt'
+        torch.save(activations_tensor_flat, output_file)
+        saved_files.append(output_file)
+        print(f"Saved chunk to {output_file}")
+        print(f"Chunk file size: {os.path.getsize(output_file) / (1024*1024):.2f} MB")
+        
+        # Clear activations and increment counter
+        activations = []
+        file_count += 1
+
     with torch.no_grad():
         for batch_idx, data in enumerate(data_loader):
             print(f"\nProcessing batch {batch_idx + 1}")
@@ -183,29 +174,25 @@ def collect_activations_batched(model, data_loader, device):
             examples_processed += current_batch_size
             print(f"Total examples processed: {examples_processed}")
             
+            # Check if we should save current chunk
+            if examples_processed >= (file_count + 1) * max_examples_per_file:
+                save_current_activations()
+            
+    # Save any remaining activations
+    if activations:
+        save_current_activations()
+    
     # Remove the hook
     hook.remove()
     print("\nHook removed")
     
-    # Concatenate all activations
-    print("\nConcatenating activations...")
-    activations_tensor = torch.cat(activations, dim=0)
-    print(f"Final activations shape: {activations_tensor.shape}")
-    print(f"Final activations dtype: {activations_tensor.dtype}")
-    print(f"Final activations device: {activations_tensor.device}")
+    print(f"\n=== Summary ===")
+    print(f"Total examples processed: {examples_processed}")
+    print(f"Number of files created: {len(saved_files)}")
+    for i, file_path in enumerate(saved_files):
+        print(f"  File {i+1}: {file_path}")
     
-    # Flatten activations
-    print("\nFlattening activations...")
-    # Get original shape dimensions
-    sample_size, seq_length, embed_dim = activations_tensor.shape
-    # Reshape to [sample_size*seq_length, embed_dim] instead of [sample_size, seq_length*embed_dim]
-    activations_tensor_flat = activations_tensor.reshape(sample_size * seq_length, embed_dim)
-    print(f"Original activations shape: {activations_tensor.shape} -> [sample_size, seq_length, embed_dim]")
-    print(f"Flattened activations shape: {activations_tensor_flat.shape} -> [sample_size*seq_length, embed_dim]")
-    print(f"Flattened activations dtype: {activations_tensor_flat.dtype}")
-    print(f"Flattened activations device: {activations_tensor_flat.device}")
-    
-    return activations_tensor_flat, examples_processed
+    return saved_files, examples_processed
 
 if __name__ == '__main__':
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -228,12 +215,16 @@ if __name__ == '__main__':
 
     # Collect activations from a subset of the data
     print("\n=== Starting Main Collection Process ===")
-    print(f"Will collect activations from all available examples in the data loader")
-    activations, total_examples = collect_activations_batched(model, data_loader_train, device=device)
+    print(f"Will collect activations and save them in chunks of 5000 examples each")
+    saved_files, total_examples = collect_activations_batched(model, data_loader_train, device=device)
 
-    # Save activations to file
-    print("\n=== Saving Activations ===")
-    output_file = f'/mnt/home/rzhang/ceph/activations_{total_examples}examples.pt'
-    torch.save(activations, output_file)
-    print(f"Saved {total_examples} examples of activations to {output_file}")
-    print(f"File size: {os.path.getsize(output_file) / (1024*1024):.2f} MB")
+    # Print summary of saved files
+    print("\n=== Activation Collection Complete ===")
+    print(f"Total examples processed: {total_examples}")
+    print(f"Number of files created: {len(saved_files)}")
+    total_size_mb = 0
+    for i, file_path in enumerate(saved_files):
+        file_size_mb = os.path.getsize(file_path) / (1024*1024)
+        total_size_mb += file_size_mb
+        print(f"  File {i+1}: {file_path} ({file_size_mb:.2f} MB)")
+    print(f"Total storage used: {total_size_mb:.2f} MB")

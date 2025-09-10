@@ -20,15 +20,18 @@ def train_sae(activations_tensor_flat, autoencoder, device):
     criterion = nn.MSELoss()
     optimizer = torch.optim.Adam(autoencoder.parameters(), lr=1e-4)
     # sparsity_lambda = 1e-3
-    patience = 70
+
+    # Enhanced early stopping parameters
+    patience = 50  
+    min_relative_improvement = 0.001  # Minimum relative improvement (0.1%)
     best_loss = float('inf')
     epochs_without_improvement = 0
-    
+
     # Parameters for dead latent auxiliary loss
     k_aux = autoencoder.k * 2  # Number of top-k dead latents to use for auxiliary loss
     aux_lambda = 0.1  # Weight for auxiliary loss
 
-    num_epochs = 100
+    num_epochs = 1000
     activation_counts = np.zeros(autoencoder.encoder.out_features)
     total_samples = 0
     for epoch in range(num_epochs):
@@ -54,7 +57,7 @@ def train_sae(activations_tensor_flat, autoencoder, device):
             # Compute auxiliary loss using top-k dead latents
             with torch.no_grad():
                 # Get indices of dead latents
-                dead_latents = autoencoder.get_dead_latents()
+                dead_latents = autoencoder.get_dead_latents(torch.from_numpy(activation_counts), total_samples)
                 if len(dead_latents) > 0:
                     # Get the k_aux largest dead latents by their maximum activation
                     max_acts = torch.max(autoencoder.encoder.weight[dead_latents], dim=1)[0]
@@ -108,7 +111,7 @@ def train_sae(activations_tensor_flat, autoencoder, device):
         avg_l0_loss = total_l0_loss / len(dataloader)
         
         # Get dead latent ratio
-        dead_ratio = autoencoder.get_dead_latent_ratio()
+        dead_ratio = autoencoder.get_dead_latent_ratio(torch.from_numpy(activation_counts), total_samples)
         
         print(f'Epoch [{epoch+1}/{num_epochs}], Loss: {avg_loss:.6f}, '
               f'Reconstruction Loss: {avg_reconstruction_loss:.6f}, '
@@ -127,7 +130,9 @@ def train_sae(activations_tensor_flat, autoencoder, device):
             # "l0_loss": avg_l0_loss
             "auxiliary_loss": avg_aux_loss,
             "l0_loss": avg_l0_loss,
-            "dead_latent_ratio": dead_ratio
+            "dead_latent_ratio": dead_ratio,
+            "epochs_without_improvement": epochs_without_improvement,
+            "best_loss": best_loss
         })
 
         # Log/plot activation frequency every 10 epochs
@@ -152,17 +157,17 @@ def train_sae(activations_tensor_flat, autoencoder, device):
             activation_counts[:] = 0
             total_samples = 0
 
-        if avg_loss < best_loss:
+        if avg_loss < best_loss * (1 - min_relative_improvement):
             best_loss = avg_loss
             epochs_without_improvement = 0
             torch.save(autoencoder.state_dict(), f"best_llm_sae_{wandb.run.name}.pth")
-            print(f"New best model saved with loss {best_loss:.6f}")
+            print(f"New best model saved with loss {best_loss:.6f} (relative improvement > {min_relative_improvement:.1%})")
         else:
             epochs_without_improvement += 1
 
-        # Early stopping check
+        # Early stopping checks
         if epochs_without_improvement >= patience:
-            print(f"Stopping early after {epoch+1} epochs due to no improvement.")
+            print(f"Stopping early after {epoch+1} epochs due to no meaningful improvement for {patience} epochs.")
             break
 
 # Initialize wandb
