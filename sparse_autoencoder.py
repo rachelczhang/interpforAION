@@ -16,7 +16,7 @@ class TopK(nn.Module):
         out = x * mask
         # Debug: print mean number of nonzero activations per sample (should be k)
         if self.training:
-            nonzero_per_sample = (out.abs() > 1e-12).sum(dim=1).float().mean().item()
+            nonzero_per_sample = (out.abs() > 1e-6).sum(dim=1).float().mean().item()
             print(f"[TopK] Mean nonzero activations per sample: {nonzero_per_sample:.2f} (target k={self.k})")
         return out
 
@@ -52,7 +52,8 @@ class SparseAutoencoder(nn.Module):
         # Subtract bias before encoding (as per paper equation 2)
         x = x - self.bias
         # Apply encoder and TopK activation
-        return self.topk(self.encoder(x))
+        encoded = self.topk(self.encoder(x))
+        return encoded
         
     def forward(self, x):
         encoded = self.encode(x)
@@ -62,16 +63,15 @@ class SparseAutoencoder(nn.Module):
     # def normalize_decoder_weights(self):
     #     """Normalize decoder weights to prevent degenerate solutions"""
 
-    def get_dead_latents(self, threshold=1e-12):
+    def get_dead_latents(self, threshold=1e-6, activation_counts=None, total_samples=None):
         """Return indices of dead latents (those that never activate)."""
-        with torch.no_grad():
-            # Get the maximum activation for each latent across all examples
-            max_acts = torch.max(self.encoder.weight, dim=1)[0]
-            # A latent is dead if its maximum activation is below threshold
-            dead_mask = max_acts < threshold
-            return torch.where(dead_mask)[0]
+        if activation_counts is None or total_samples is None:
+            return torch.tensor([], dtype=torch.long)
+        activation_rates = activation_counts / total_samples
+        dead_mask = activation_rates < threshold
+        return torch.where(dead_mask)[0]
     
-    def get_alive_latents(self, threshold=1e-12):
+    def get_alive_latents(self, threshold=1e-6):
         """Return indices of alive latents (those that do activate)."""
         with torch.no_grad():
             # self.decoder.weight.data = F.normalize(
@@ -81,7 +81,7 @@ class SparseAutoencoder(nn.Module):
             alive_mask = max_acts >= threshold
             return torch.where(alive_mask)[0]
     
-    def get_dead_latent_ratio(self, threshold=1e-12):
+    def get_dead_latent_ratio(self, threshold=1e-6, activation_counts=None, total_samples=None):
         """Return the ratio of dead latents."""
-        dead_latents = self.get_dead_latents(threshold)
+        dead_latents = self.get_dead_latents(threshold, activation_counts, total_samples)
         return len(dead_latents) / self.encoder.weight.shape[0]
