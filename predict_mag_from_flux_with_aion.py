@@ -22,6 +22,11 @@ flux_g_data = torch.load('AION/tests/test_data/FLUX_G_codec_input_batch.pt')
 flux_g_data = flux_g_data.float().to(device)
 batch_size = 32  # You can change this as needed
 
+# DEBUG: Print shapes to verify if they match
+print(f"\n=== DEBUGGING DATASET COMPATIBILITY ===")
+print(f"flux_g_data shape: {flux_g_data.shape}")
+print(f"flux_g_data samples: {len(flux_g_data)}")
+
 # 3. Only use positive fluxes for valid magnitude prediction
 positive_mask = flux_g_data > 0
 flux_g_data_pos = flux_g_data[positive_mask]
@@ -120,7 +125,6 @@ plt.tight_layout()
 plt.savefig('aion_predicted_vs_expected_mag.png', dpi=150)
 print("\n📊 Plot saved as 'aion_predicted_vs_expected_mag.png'")
 
-# Print statistics
 diff = pred_mag_scalar - expected_mag
 print(f"\n=== STATISTICS ===")
 print(f"Mean difference (AION - expected): {np.mean(diff):.6f}")
@@ -132,7 +136,6 @@ print(f"Max difference: {np.max(diff):.6f}")
 correlation = np.corrcoef(expected_mag, pred_mag_scalar)[0, 1]
 print(f"Pearson correlation coefficient: {correlation:.6f}")
 
-# Additional statistics
 print(f"\n=== DATA RANGES ===")
 print(f"Expected magnitude range: {expected_mag.min():.2f} to {expected_mag.max():.2f}")
 print(f"Predicted magnitude range: {pred_mag_scalar.min():.2f} to {pred_mag_scalar.max():.2f}")

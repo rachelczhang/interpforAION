@@ -3,9 +3,14 @@ import numpy as np
 import matplotlib.pyplot as plt
 import h5py
 import os
+import pandas as pd
+
+
+
 from tqdm import tqdm
 from aion import AION
 from aion.codecs import CodecManager
+
 from aion.modalities import (
     LegacySurveyImage,
     LegacySurveyFluxG,
@@ -259,11 +264,80 @@ def evaluate_predictions(predicted_fluxes, true_fluxes):
     
     return results
 
-def create_comparison_plots(predicted_fluxes, true_fluxes, output_dir):
+def save_outliers_to_csv(predicted_fluxes, true_fluxes, data, output_dir, threshold=1000):
     """
-    Create scatter plots comparing predicted vs true flux values.
+    Identify and save outliers (predictions > threshold) to CSV.
+    
+    Args:
+        predicted_fluxes: Dict of predicted flux values
+        true_fluxes: Dict of true flux values
+        data: Original data dict containing object_id
+        output_dir: Output directory
+        threshold: Threshold above which predictions are considered outliers
+    
+    Returns:
+        Dict with outlier masks for each band
     """
-    print("\nCreating comparison plots...")
+    print(f"\nIdentifying outliers with predicted flux > {threshold} nanomaggies...")
+    
+    outlier_records = []
+    outlier_masks = {}
+    
+    for band in ['g', 'r', 'i', 'z']:
+        pred_key = f'flux_{band}'
+        true_key = f'true_flux_{band}'
+        
+        pred_values = predicted_fluxes[pred_key]
+        true_values = true_fluxes[true_key]
+        
+        # Find outliers
+        outlier_mask = pred_values > threshold
+        outlier_masks[band] = outlier_mask
+        
+        n_outliers = np.sum(outlier_mask)
+        print(f"{band.upper()}-band: {n_outliers}/{len(pred_values)} outliers ({100*n_outliers/len(pred_values):.1f}%)")
+        
+        # Get outlier data
+        if n_outliers > 0:
+            outlier_indices = np.where(outlier_mask)[0]
+            for idx in outlier_indices:
+                record = {
+                    'band': band.upper(),
+                    'object_id': data['object_id'][idx] if 'object_id' in data else idx,
+                    'ra': data['ra'][idx] if 'ra' in data else None,
+                    'dec': data['dec'][idx] if 'dec' in data else None,
+                    'true_flux': true_values[idx],
+                    'predicted_flux': pred_values[idx],
+                    'ratio_pred_to_true': pred_values[idx] / true_values[idx] if true_values[idx] != 0 else np.inf
+                }
+                outlier_records.append(record)
+    
+    # Save to CSV
+    if outlier_records:
+        df = pd.DataFrame(outlier_records)
+        csv_path = os.path.join(output_dir, 'flux_outliers.csv')
+        df.to_csv(csv_path, index=False)
+        print(f"\nSaved {len(outlier_records)} outlier records to {csv_path}")
+        
+        # Print summary statistics
+        print("\nOutlier summary by band:")
+        for band in ['G', 'R', 'I', 'Z']:
+            band_outliers = df[df['band'] == band]
+            if len(band_outliers) > 0:
+                print(f"  {band}-band: {len(band_outliers)} outliers")
+                print(f"    Predicted range: {band_outliers['predicted_flux'].min():.1f} to {band_outliers['predicted_flux'].max():.1f}")
+                print(f"    True range: {band_outliers['true_flux'].min():.1f} to {band_outliers['true_flux'].max():.1f}")
+                print(f"    Max ratio (pred/true): {band_outliers['ratio_pred_to_true'].max():.1f}")
+    else:
+        print("No outliers found.")
+    
+    return outlier_masks
+
+def create_comparison_plots(predicted_fluxes, true_fluxes, output_dir, outlier_threshold=1000):
+    """
+    Create scatter plots comparing predicted vs true flux values, excluding outliers.
+    """
+    print(f"\nCreating comparison plots (excluding predictions > {outlier_threshold})...")
     
     fig, axes = plt.subplots(2, 2, figsize=(12, 10))
     axes = axes.flatten()
@@ -275,28 +349,41 @@ def create_comparison_plots(predicted_fluxes, true_fluxes, output_dir):
         pred_values = predicted_fluxes[pred_key]
         true_values = true_fluxes[true_key]
         
-        # Use all samples directly without any masking
-        pred_valid = pred_values
-        true_valid = true_values
+        # Filter out outliers
+        mask = pred_values <= outlier_threshold
+        pred_filtered = pred_values[mask]
+        true_filtered = true_values[mask]
+        
+        n_total = len(pred_values)
+        n_filtered = len(pred_filtered)
+        n_outliers = n_total - n_filtered
+        
+        print(f"{band.upper()}-band: Plotting {n_filtered}/{n_total} points ({n_outliers} outliers excluded)")
         
         ax = axes[idx]
-        ax.scatter(true_valid, pred_valid, alpha=0.6, s=20)
+        ax.scatter(true_filtered, pred_filtered, alpha=0.6, s=20)
         
         # Add 1:1 line
-        min_val = min(true_valid.min(), pred_valid.min())
-        max_val = max(true_valid.max(), pred_valid.max())
+        min_val = min(true_filtered.min(), pred_filtered.min())
+        max_val = max(true_filtered.max(), pred_filtered.max())
         ax.plot([min_val, max_val], [min_val, max_val], 'r--', alpha=0.8)
         
-        # Calculate correlation
-        corr = np.corrcoef(pred_valid, true_valid)[0, 1]
+        # Calculate correlation for filtered data
+        corr = np.corrcoef(pred_filtered, true_filtered)[0, 1]
         
         ax.set_xlabel(f'True {band.upper()}-band Flux')
         ax.set_ylabel(f'Predicted {band.upper()}-band Flux')
         ax.set_title(f'{band.upper()}-band: r = {corr:.3f}')
         ax.grid(True, alpha=0.3)
+        
+        # Add text showing number of outliers excluded
+        if n_outliers > 0:
+            ax.text(0.05, 0.95, f'{n_outliers} outliers excluded', 
+                   transform=ax.transAxes, verticalalignment='top',
+                   bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.5))
     
     plt.tight_layout()
-    plt.savefig(os.path.join(output_dir, 'predicted_vs_true_flux.png'), dpi=150, bbox_inches='tight')
+    plt.savefig(os.path.join(output_dir, 'predicted_vs_true_flux_filtered.png'), dpi=150, bbox_inches='tight')
     plt.show()
 
 def main():
@@ -312,11 +399,12 @@ def main():
     print('model loaded')
     
     # Create output directory
-    output_dir = 'flux_prediction_results'
+    output_dir = 'pred_flux_from_image'
+    os.makedirs(output_dir, exist_ok=True)
     
     # Load data
     data_path = '/mnt/home/polymathic/ceph/MultimodalUniverse/legacysurvey/dr10_south_21/healpix=299/001-of-001.hdf5'
-    data = load_legacysurvey_data(data_path, max_samples=200)  # Limit for testing
+    data = load_legacysurvey_data(data_path, max_samples=10000)  
     print('data loaded')
     
     # Convert images to tensor and move to device
@@ -347,8 +435,11 @@ def main():
     # Evaluate predictions
     results = evaluate_predictions(predicted_fluxes, true_fluxes)
     
-    # Create comparison plots
-    create_comparison_plots(predicted_fluxes, true_fluxes, output_dir)
+    # Save outliers to CSV
+    outlier_masks = save_outliers_to_csv(predicted_fluxes, true_fluxes, data, output_dir, threshold=1000)
+    
+    # Create comparison plots (excluding outliers)
+    create_comparison_plots(predicted_fluxes, true_fluxes, output_dir, outlier_threshold=1000)
     
 
 if __name__ == "__main__":

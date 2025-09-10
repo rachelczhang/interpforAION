@@ -98,39 +98,13 @@ def probe_latent_flux_correlation(
 		pearson_raw, _ = pearsonr(latent_col, flux)
 		pearson_log, _ = pearsonr(latent_col, log_flux)
 		spearman_raw, _ = spearmanr(latent_col, flux)
-		spearman_log, _ = spearmanr(latent_col, log_flux)
 		
 		# Calculate correlations only for non-zero activations
-		nonzero_mask = latent_col != 0
-		n_nonzero = np.sum(nonzero_mask)
-		
-		if n_nonzero > 1:  # Need at least 2 points for correlation
-			latent_nonzero = latent_col[nonzero_mask]
-			flux_nonzero = flux[nonzero_mask]
-			log_flux_nonzero = log_flux[nonzero_mask]
-			
-			pearson_raw_nonzero, _ = pearsonr(latent_nonzero, flux_nonzero)
-			pearson_log_nonzero, _ = pearsonr(latent_nonzero, log_flux_nonzero)
-			spearman_raw_nonzero, _ = spearmanr(latent_nonzero, flux_nonzero)
-			spearman_log_nonzero, _ = spearmanr(latent_nonzero, log_flux_nonzero)
-		else:
-			pearson_raw_nonzero = np.nan
-			pearson_log_nonzero = np.nan
-			spearman_raw_nonzero = np.nan
-			spearman_log_nonzero = np.nan
-		
 		results.append({
 			'latent_idx': i,
 			'pearson_raw': pearson_raw,
 			'pearson_log': pearson_log,
-			'spearman_raw': spearman_raw,
-			'spearman_log': spearman_log,
-			'pearson_raw_nonzero': pearson_raw_nonzero,
-			'pearson_log_nonzero': pearson_log_nonzero,
-			'spearman_raw_nonzero': spearman_raw_nonzero,
-			'spearman_log_nonzero': spearman_log_nonzero,
-			'n_nonzero': n_nonzero,
-			'fraction_nonzero': n_nonzero / len(latent_col)
+			'spearman_raw': spearman_raw
 		})
 	
 	# Filter out results with nan correlations
@@ -155,7 +129,25 @@ def probe_latent_flux_correlation(
 	print("Top-{} latent correlations with log10(flux):".format(actual_top_k))
 	for j in range(actual_top_k):
 		idx = results_sorted[j]['latent_idx']
-		print(f" Latent {idx}: Pearson={results_sorted[j]['pearson_log']:.4f}, Spearman={results_sorted[j]['spearman_log']:.4f}")
+		print(f" Latent {idx}: Pearson={results_sorted[j]['pearson_log']:.4f}, Spearman={results_sorted[j]['spearman_raw']:.4f}")
+
+	# Print top 20 by pearson_raw
+	print("\nTop 20 by Pearson correlation with raw flux:")
+	top_20_pearson_raw = sorted(valid_results, key=lambda x: abs(x['pearson_raw']), reverse=True)[:20]
+	for r in top_20_pearson_raw:
+		print(f" Latent {r['latent_idx']}: Pearson_raw={r['pearson_raw']:.4f}, Pearson_log={r['pearson_log']:.4f}, Spearman_raw={r['spearman_raw']:.4f}")
+
+	# Print top 20 by pearson_log
+	print("\nTop 20 by Pearson correlation with log10(flux):")
+	top_20_pearson_log = sorted(valid_results, key=lambda x: abs(x['pearson_log']), reverse=True)[:20]
+	for r in top_20_pearson_log:
+		print(f" Latent {r['latent_idx']}: Pearson_log={r['pearson_log']:.4f}, Pearson_raw={r['pearson_raw']:.4f}, Spearman_raw={r['spearman_raw']:.4f}")
+
+	# Print top 20 by spearman_raw
+	print("\nTop 20 by Spearman correlation with raw flux:")
+	top_20_spearman_raw = sorted(valid_results, key=lambda x: abs(x['spearman_raw']), reverse=True)[:20]
+	for r in top_20_spearman_raw:
+		print(f" Latent {r['latent_idx']}: Spearman_raw={r['spearman_raw']:.4f}, Pearson_log={r['pearson_log']:.4f}, Pearson_raw={r['pearson_raw']:.4f}")
 	
 	all_corrs = [abs(r['pearson_log']) for r in valid_results]
 	print(f"Correlation stats (valid only): min={np.min(all_corrs):.4f}, max={np.max(all_corrs):.4f}, mean={np.mean(all_corrs):.4f}")
