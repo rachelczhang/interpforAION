@@ -145,7 +145,7 @@ def collect_activations(model, data_loader, device, args):
             if training_format_batch is None:
                 print(f"Skipping batch {batch_idx} due to transformation error")
                 continue
-
+            
             # Use PURE TRAINING code from fm.py - this gives us proper target_ids!
             
             # Encoder side - use forward_mask_encoder (training function)

@@ -113,55 +113,336 @@ def collect_activations_with_raw_data_mapping(
                 dec_mod_mask,
             ) = model.embed_targets(target_mask, num_decoder_tokens=args.num_target_tokens)
 
-            # DEBUG: Check what the decoder is actually seeing vs actual tokens
-            if batch_idx == 0:  # Only print for first batch
-                print(f"DEBUG: Checking masking across all modalities")
-                print(f"target_ids: {target_ids[0, :10].tolist()}")
-                print(f"dec_mod_mask: {dec_mod_mask[0, :10].tolist()}")
-                print(f"dec_mask: {dec_mask[0, 0, :10].tolist()}")  # Note: dec_mask has shape (B, 1, M)
-                print(f"dec_emb: {dec_emb[0, :10].tolist()}")
-                print(f"dec_att_mask: {dec_att_mask[0, :10].tolist()}")
+            # NEW: Check if entire target_ids tensor is just zeros
+            print(f'\n=== CHECKING IF TARGET_IDS IS ALL ZEROS ===')
+            print(f'target_ids shape: {target_ids.shape}')
+            print(f'Are ALL target_ids zeros? {torch.all(target_ids == 0)}')
+            print(f'Number of zero values: {(target_ids == 0).sum().item()} / {target_ids.numel()}')
+            print(f'Unique values in target_ids: {torch.unique(target_ids)}')
+            print('=== END TARGET_IDS CHECK ===\n')
 
-                print(f"enc_mask: {enc_mask[0, 0, :10].tolist()}")  # Note: enc_mask has shape (B, 1, N)
-                print(f"encoder_mod_mask: {encoder_mod_mask[0, :10].tolist()}")
+            # DEBUG: Check why target_ids are all zeros
+            print('\n=== DEBUGGING TARGET_IDS ===')
+            print('Target mask contents for tok_spectrum_sdss modality:')
+            target_mod = 'tok_spectrum_sdss'
+            print(f'Modality: {target_mod}')
+            print(f'Target mask shape: {target_mask[target_mod].shape}')
+            print(f'Target mask first sample: {target_mask[target_mod][0]}')
+            print(f'Positions to predict (False): {(~target_mask[target_mod][0]).nonzero().flatten()}')
+            print(f'Positions not to predict (True): {target_mask[target_mod][0].nonzero().flatten()}')
+
+            print(f'\nActual tokens for {target_mod} (first sample):')
+            actual_tokens_target_mod = processed_batch[target_mod]["tensor"][0]
+            print(f'Shape: {actual_tokens_target_mod.shape}')
+            print(f'First 10 tokens: {actual_tokens_target_mod[:10]}')
+            print(f'Last 10 tokens: {actual_tokens_target_mod[-10:]}')
+            
+            # Check if there are any non-zero tokens - FIX THE BUG
+            print(f'All tokens in sequence: {actual_tokens_target_mod}')
+            non_zero_mask = (actual_tokens_target_mod != 0)
+            non_zero_positions = non_zero_mask.nonzero().flatten()
+            zero_positions = (~non_zero_mask).nonzero().flatten()
+            print(f'Non-zero token positions (total {len(non_zero_positions)}): {non_zero_positions}')
+            print(f'Zero token positions (total {len(zero_positions)}): {zero_positions}')
                 
-                # Check each modality's contribution
-                for mod_name, tokens in actual_tokens_at_positions.items():
-                    print(f"\nModality '{mod_name}':")
-                    print(f"  Original tokens: {tokens[0, :10].tolist()}")
-                    print(f"  Target mask: {target_mask[mod_name][0, :10].tolist()}")
+            # NEW: Show how the target mask maps to actual positions that will be predicted
+            print(f'\n--- MAPPING TARGET MASK TO ACTUAL TOKENS ---')
+            positions_to_predict = (~target_mask[target_mod][0]).nonzero().flatten()
+            print(f'Total positions to predict: {len(positions_to_predict)}')
+            print(f'First 10 positions to predict: {positions_to_predict[:10]}')
+            print(f'Tokens at those positions: {actual_tokens_target_mod[positions_to_predict[:10]]}')
+            # Show what tokens are NOT being predicted (kept visible)
+            positions_kept_visible = target_mask[target_mod][0].nonzero().flatten()
+            print(f'Total positions kept visible: {len(positions_kept_visible)}')
+            print(f'First 10 positions kept visible: {positions_kept_visible[:10]}')
+            print(f'Tokens at visible positions: {actual_tokens_target_mod[positions_kept_visible[:10]]}')
+            print('=== END DEBUGGING ===\n')
+            
+            # NEW: Detailed analysis of embed_targets output specifically for tok_spectrum_sdss
+            print('\n=== EMBED_TARGETS OUTPUT ANALYSIS ===')
+            print('Understanding what embed_targets produces for tok_spectrum_sdss...')
+            
+            # Find which positions in the decoder sequence correspond to tok_spectrum_sdss
+            if target_mod in model.modality_info:
+                target_mod_id = model.modality_info[target_mod]["id"]
+                print(f'{target_mod} modality ID: {target_mod_id}')
+                
+                # Find positions in decoder sequence that belong to this modality
+                sample_0_mod_mask = dec_mod_mask[0]  # First sample
+                target_mod_positions = (sample_0_mod_mask == target_mod_id).nonzero().flatten()
+                print(f'Positions in decoder sequence for {target_mod}: {target_mod_positions}')
+                print(f'Total {target_mod} positions in decoder: {len(target_mod_positions)}')
+                
+                if len(target_mod_positions) > 0:
+                    print(f'\n--- DECODER TOKENS FOR {target_mod.upper()} ---')
+                    print(f'dec_tokens shape: {dec_tokens.shape}')
+                    print(f'Decoder tokens at {target_mod} positions (first 5):')
+                    for i, pos in enumerate(target_mod_positions[:5]):
+                        token_embedding = dec_tokens[0, pos, :]
+                        print(f'  Position {pos}: embedding shape {token_embedding.shape}, first 5 values: {token_embedding[:5]}')
+                    print(f' Position 0: embedding shape {dec_tokens[0, 0, :].shape}, first 5 values: {dec_tokens[0, 0, :5]}')
                     
-                    # Find which positions in the decoder sequence come from this modality
-                    mod_id = None
-                    if hasattr(model, 'modality_info') and mod_name in model.modality_info:
-                        mod_id = model.modality_info[mod_name]['id']
-                        positions_from_this_mod = (dec_mod_mask[0] == mod_id).nonzero().flatten()
-                        print(f"  Modality ID: {mod_id}")
-                        print(f"  Positions in decoder: {positions_from_this_mod.tolist()}")           
-                        # Show what decoder sees at those positions
-                        decoder_tokens_for_this_mod = target_ids[0][positions_from_this_mod]
-                        print(f"  Decoder sees tokens: {decoder_tokens_for_this_mod.tolist()}")
+                    # NEW: Print first few and last few 768-dimensional decoder token vectors
+                    print(f'\n--- ANALYZING 768-DIMENSIONAL DECODER TOKEN VECTORS ---')
+                    print(f'dec_tokens shape: {dec_tokens.shape}')
+                    
+                    # Print first few decoder tokens (should be mask tokens if they're for prediction)
+                    print(f'\nFIRST FEW DECODER TOKENS (positions 0-4):')
+                    for pos in range(min(5, dec_tokens.shape[1])):
+                        token_vec = dec_tokens[0, pos, :]  # First sample, position pos
+                        print(f'  Position {pos}:')
+                        print(f'    First 10 values: {token_vec[:10].tolist()}')
+                        print(f'    Last 10 values:  {token_vec[-10:].tolist()}')
+                        print(f'    All zeros? {torch.all(token_vec == 0.0)}')
+                        print(f'    All same value? {torch.all(token_vec == token_vec[0])}')
+                        print(f'    Mean: {token_vec.mean():.6f}, Std: {token_vec.std():.6f}')
+                        print()
+                    
+                    # Print last few decoder tokens (might be padding)
+                    print(f'LAST FEW DECODER TOKENS (positions {dec_tokens.shape[1]-5}-{dec_tokens.shape[1]-1}):')
+                    for pos in range(max(0, dec_tokens.shape[1]-5), dec_tokens.shape[1]):
+                        token_vec = dec_tokens[0, pos, :]  # First sample, position pos
+                        print(f'  Position {pos}:')
+                        print(f'    First 10 values: {token_vec[:10].tolist()}')
+                        print(f'    Last 10 values:  {token_vec[-10:].tolist()}')
+                        print(f'    All zeros? {torch.all(token_vec == 0.0)}')
+                        print(f'    All same value? {torch.all(token_vec == token_vec[0])}')
+                        print(f'    Mean: {token_vec.mean():.6f}, Std: {token_vec.std():.6f}')
+                        print()
+                    print(f'\n--- TARGET IDS FOR {target_mod.upper()} ---')
+                    print(f'target_ids shape: {target_ids.shape}')
+                    target_ids_for_mod = target_ids[0, target_mod_positions]
+                    print(f'Target IDs at {target_mod} positions: {target_ids_for_mod}')
+                    print(f'Target IDs first 10: {target_ids_for_mod[:10]}')
+                    print(f'Target IDs last 10: {target_ids_for_mod[-10:]}')
+                    
+                    print(f'\n--- DECODER MASK FOR {target_mod.upper()} ---')
+                    print(f'dec_mask shape: {dec_mask.shape}')
+                    # dec_mask has shape (B, 1, M) - squeeze to (B, M)
+                    decoder_mask_squeezed = dec_mask.squeeze(1) if dec_mask.ndim == 3 else dec_mask
+                    dec_mask_for_mod = decoder_mask_squeezed[0, target_mod_positions]
+                    print(f'Decoder mask at {target_mod} positions: {dec_mask_for_mod}')
+                    print(f'Decoder mask (first 10): {dec_mask_for_mod[:10]}')
+                    print(f'Decoder mask (last 10): {dec_mask_for_mod[-10:]}')
+                    print(f'True (masked) positions: {dec_mask_for_mod.sum()} / {len(dec_mask_for_mod)}')
+                    
+                    print(f'\n--- DECODER EMBEDDINGS FOR {target_mod.upper()} ---')
+                    print(f'dec_emb shape: {dec_emb.shape}')
+                    print(f'Decoder embeddings at {target_mod} positions (first 3):')
+                    for i, pos in enumerate(target_mod_positions[:3]):
+                        emb = dec_emb[0, pos, :]
+                        print(f'  Position {pos}: embedding shape {emb.shape}, first 5 values: {emb[:5]}')
+                    print(f' Position 0: embedding shape {dec_emb[0, 0, :].shape}, first 5 values: {dec_emb[0, 0, :5]}')
 
-                # NEW: Critical debug - check if ANY position has prediction masking
-                print(f"\n=== CRITICAL DEBUG ===")
-                for mod_name in target_mask.keys():
-                    mask_values = target_mask[mod_name][0]
-                    false_count = (mask_values == False).sum().item()
-                    true_count = (mask_values == True).sum().item()
-                    print(f"Modality {mod_name}: {false_count} positions to predict, {true_count} positions not to predict")
+                    print(f'\n--- DECODER ATTENTION MASK FOR {target_mod.upper()} ---')
+                    print(f'dec_att_mask shape: {dec_att_mask.shape}')
+                    print(f'Attention mask at {target_mod} positions (first 5x5 submatrix):')
+                    att_mask_for_mod = dec_att_mask[0, target_mod_positions[:5], :][:, target_mod_positions[:5]]
+                    print(att_mask_for_mod)
+                    print(f'Attention mask allows attention to itself? {dec_att_mask[0, target_mod_positions[0], target_mod_positions[0]]}')
+                    
+                    # NEW: Let's specifically check attention patterns within vs between modalities
+                    print(f'\n--- DETAILED ATTENTION PATTERN ANALYSIS ---')
+                    if len(target_mod_positions) > 1:
+                        print(f'Checking attention WITHIN {target_mod} modality:')
+                        # Check attention between first two tok_spectrum_sdss positions
+                        pos1, pos2 = target_mod_positions[0], target_mod_positions[1]
+                        can_attend = not dec_att_mask[0, pos1, pos2].item()  # False = can attend
+                        print(f'  Position {pos1} can attend to position {pos2}? {can_attend}')
+                        print(f'  Position {pos2} can attend to position {pos1}? {not dec_att_mask[0, pos2, pos1].item()}')
+                        
+                        # Show the full attention pattern within this modality
+                        within_modality_mask = dec_att_mask[0, target_mod_positions[:4], :][:, target_mod_positions[:4]]
+                        print(f'  Attention mask within {target_mod} (4x4 submatrix, False=can_attend):')
+                        print(f'  {within_modality_mask}')
+                    
+                    # Check attention between different modalities
+                    other_modality_positions = (dec_mod_mask[0] != target_mod_id).nonzero().flatten()
+                    if len(other_modality_positions) > 0 and len(target_mod_positions) > 0:
+                        print(f'\nChecking attention BETWEEN modalities:')
+                        pos_target = target_mod_positions[0]
+                        pos_other = other_modality_positions[0]
+                        can_attend_cross = not dec_att_mask[0, pos_target, pos_other].item()
+                        print(f'  {target_mod} position {pos_target} can attend to other modality position {pos_other}? {can_attend_cross}')
+                        print(f'  Other modality position {pos_other} can attend to {target_mod} position {pos_target}? {not dec_att_mask[0, pos_other, pos_target].item()}')
+                        
+                        # Show cross-modality attention pattern
+                        cross_modality_mask = dec_att_mask[0, target_mod_positions[:2], :][:, other_modality_positions[:2]]
+                        print(f'  Cross-modality attention mask (2x2 submatrix, False=can_attend):')
+                        print(f'  {cross_modality_mask}')
+                    
+                    print(f'--- END DETAILED ATTENTION PATTERN ANALYSIS ---')
+                    
+                    # NEW: Debug the decoder attention mask computation
+                    print(f'\n--- DEBUGGING DECODER ATTENTION MASK COMPUTATION ---')
+                    
+                    # First, let's see the original decoder_attention_mask before adapt_decoder_attention_mask
+                    print(f'Original target_mask for {target_mod}: {target_mask[target_mod][0]}')
+                    print(f'False positions (to predict): {(~target_mask[target_mod][0]).nonzero().flatten()}')
+                    print(f'True positions (keep visible): {target_mask[target_mod][0].nonzero().flatten()}')
+                    
+                    # Let's also check the decoder_attention_mask from the modality dict
+                    if target_mod in processed_batch:
+                        if "decoder_attention_mask" in processed_batch[target_mod]:
+                            raw_decoder_att_mask = processed_batch[target_mod]["decoder_attention_mask"][0]
+                            print(f'Raw decoder_attention_mask from {target_mod}: {raw_decoder_att_mask}')
+                            print(f'Raw decoder_attention_mask shape: {raw_decoder_att_mask.shape}')
+                            print(f'Raw decoder_attention_mask values: {torch.unique(raw_decoder_att_mask)}')
+                        else:
+                            print(f'No decoder_attention_mask found in processed_batch[{target_mod}]')
+                    
+                    # Check what happens in adapt_decoder_attention_mask
+                    print(f'\n--- ANALYZING adapt_decoder_attention_mask LOGIC ---')
+                    print(f'Model decoder_causal_mask: {model.decoder_causal_mask}')
+                    print(f'Model decoder_sep_mask: {model.decoder_sep_mask}')
+                    
+                    # Let's manually trace through the logic for the tok_spectrum_sdss positions
+                    if len(target_mod_positions) > 0:
+                        print(f'\nFor {target_mod} positions {target_mod_positions[:3]}:')
+                        
+                        # Check modality IDs
+                        mod_ids_for_positions = dec_mod_mask[0, target_mod_positions[:3]]
+                        print(f'Modality IDs: {mod_ids_for_positions}')
+                        
+                        # If decoder_sep_mask is True, different modalities can't attend to each other
+                        if model.decoder_sep_mask:
+                            print(f'decoder_sep_mask is True - tokens can only attend within same modality')
+                            
+                            # Check which positions have the same modality ID as our target_mod
+                            target_mod_id = model.modality_info[target_mod]["id"]
+                            same_modality_positions = (dec_mod_mask[0] == target_mod_id).nonzero().flatten()
+                            different_modality_positions = (dec_mod_mask[0] != target_mod_id).nonzero().flatten()
+                            
+                            print(f'Positions with same modality ID ({target_mod_id}): {same_modality_positions}')
+                            print(f'Positions with different modality IDs: {different_modality_positions[:10]} (first 10)')
+                            
+                            # For sep_mask: positions with different modalities get True (blocked)
+                            print(f'sep_mask logic: different modalities get True (blocked from attending)')
+                            
+                        # Let's also check the actual decoder_attention_mask that was input
+                        print(f'\n--- CHECKING INPUT TO adapt_decoder_attention_mask ---')
+                        # We need to look at the decoder_attention_mask before it gets adapted
+                        # This should be in the cat_decoder_tensors output
+                        
+                        # Let's manually run through what cat_decoder_tensors would produce
+                        print(f'For {target_mod} - checking cat_decoder_tensors logic:')
+                        original_attention_mask = processed_batch[target_mod].get("decoder_attention_mask", None)
+                        if original_attention_mask is not None:
+                            print(f'  Original decoder_attention_mask shape: {original_attention_mask.shape}')
+                            print(f'  Original decoder_attention_mask[0]: {original_attention_mask[0]}')
+                            print(f'  Original decoder_attention_mask unique values: {torch.unique(original_attention_mask)}')
+                            
+                            # This gets fed into adapt_decoder_attention_mask as decoder_attention_mask_all
+                            # After gather/sorting, what would be the input to adapt_decoder_attention_mask?
+                            
+                        # Also check: what should cumsum_mask be?
+                        print(f'\nManual cumsum calculation for debugging:')
+                        if original_attention_mask is not None:
+                            sample_att_mask = original_attention_mask[0]  # First sample
+                            print(f'  Sample attention mask: {sample_att_mask}')
+                            manual_cumsum = torch.cumsum(sample_att_mask.int(), dim=-1)
+                            print(f'  Manual cumsum: {manual_cumsum}')
+                            
+                            # What would attention_arange >= cumsum give us?
+                            N = len(sample_att_mask)
+                            attention_arange = torch.arange(N, device=sample_att_mask.device)
+                            print(f'  attention_arange: {attention_arange}')
+                            comparison_result = attention_arange.unsqueeze(0) >= manual_cumsum.unsqueeze(1)
+                            print(f'  attention_arange >= cumsum_mask result: {comparison_result}')
+                        else:
+                            print(f'  No original decoder_attention_mask to analyze')
+
+                    print(f'--- END DECODER ATTENTION MASK DEBUGGING ---\n')
+
+                    print(f'\n--- DECODER MODALITY MASK FOR {target_mod.upper()} ---')
+                    print(f'dec_mod_mask shape: {dec_mod_mask.shape}')
+                    dec_mod_mask_for_mod = dec_mod_mask[0, target_mod_positions]
+                    print(f'Modality IDs at {target_mod} positions: {dec_mod_mask_for_mod}')
+                    print(f'All positions have correct modality ID? {torch.all(dec_mod_mask_for_mod == target_mod_id)}')
+                        
+                    print(f'\n--- RELATIONSHIP BETWEEN ORIGINAL AND DECODER ---')
+                    print(f'Original {target_mod} sequence length: {actual_tokens_target_mod.shape[0]}')
+                    print(f'Decoder positions for {target_mod}: {len(target_mod_positions)}')
+                    print(f'Are they equal? {actual_tokens_target_mod.shape[0] == len(target_mod_positions)}')
+                    
+                    # Show the mapping between original positions and decoder positions
+                    print(f'\nMapping original -> decoder positions (first 10):')
+                    for i, decoder_pos in enumerate(target_mod_positions[:10]):
+                        original_token = actual_tokens_target_mod[i]
+                        target_id = target_ids[0, decoder_pos] 
+                        was_masked = decoder_mask_squeezed[0, decoder_pos]
+                        print(f'  Original pos {i}: token {original_token} -> Decoder pos {decoder_pos}: target_id {target_id}, masked={was_masked}')
+                        
+                    # NEW: Critical analysis - understand what target_ids should actually be
+                    print(f'\n--- WHAT SHOULD TARGET_IDS ACTUALLY BE? ---')
+                    print(f'The target_ids we see: {target_ids[0, target_mod_positions]}')
+                    print(f'But positions to predict in original sequence were: {positions_to_predict}')
+                    print(f'Tokens at those positions were: {actual_tokens_target_mod[positions_to_predict]}')
+                    
+                    # Check if embed_targets is supposed to copy the actual tokens that need prediction
+                    print(f'\nLet\'s examine what embed_targets should be doing:')
+                    print(f'1. Original sequence has {len(actual_tokens_target_mod)} tokens')
+                    print(f'2. Only {len(positions_to_predict)} positions need prediction')
+                    print(f'3. But decoder has {len(target_mod_positions)} positions for this modality')
+                    print(f'4. If decoder only gets predicted positions, target_ids should be:')
+                    if len(positions_to_predict) == len(target_mod_positions):
+                        expected_target_ids = actual_tokens_target_mod[positions_to_predict]
+                        print(f'   Expected target_ids: {expected_target_ids}')
+                        print(f'   Actual target_ids: {target_ids[0, target_mod_positions]}')
+                        print(f'   Do they match? {torch.equal(expected_target_ids, target_ids[0, target_mod_positions])}')
+                    else:
+                        print(f'   Mismatch: {len(positions_to_predict)} positions to predict but {len(target_mod_positions)} decoder positions')
+                        print(f'   This suggests embed_targets uses a different selection strategy')
+                        
+                    # Let's also check if the decoder tokens are actually the right embeddings
+                    print(f'\n--- ARE DECODER TOKENS CORRECT? ---')
+                    print(f'Decoder token at position {target_mod_positions[0]}: {dec_tokens[0, target_mod_positions[0], :5]}')
+                    print(f'This looks like mask token embedding (all positions identical)')
+                    print(f'For masked positions, decoder should get mask token embedding')
+                    print(f'For visible positions, decoder should get actual token embedding')
+                    print(f'Expected: If position was masked for prediction -> mask embedding')
+                    print(f'Expected: If position was visible -> actual token embedding')
+
+            print('=== END EMBED_TARGETS OUTPUT ANALYSIS ===\n')
+
+            # Analyze which positions have zero vs non-zero tensors
+            print('\nANALYZING ZERO vs NON-ZERO POSITIONS:')
+
+            zero_positions = []
+            nonzero_positions = []
+
+            # Check each position for the first sample
+            for pos in range(dec_tokens.shape[1]):
+                position_tensor = dec_tokens[0, pos, :]  # First sample, position pos
                 
-                decoder_mask_values = dec_mask[0, 0]  # Remove batch and attention dims
-                false_count = (decoder_mask_values == False).sum().item()
-                true_count = (decoder_mask_values == True).sum().item()
-                print(f"Final decoder mask: {false_count} unmasked positions, {true_count} masked positions")
-                print(f"=== END CRITICAL DEBUG ===")
+                # Check if all values are zero
+                if torch.all(position_tensor == 0.0):
+                    zero_positions.append(pos)
+                else:
+                    nonzero_positions.append(pos)
+
+            print(f'Zero tensor positions ({len(zero_positions)}): {zero_positions}')
+            print(f'Non-zero tensor positions ({len(nonzero_positions)}): {nonzero_positions}')
+            # Check if all non-zero positions have the same values
+            if len(nonzero_positions) > 1:
+                print(f'\nCHECKING IF NON-ZERO POSITIONS ARE IDENTICAL:')
+                first_nonzero = dec_tokens[0, nonzero_positions[0], :]
+                all_nonzero_same = True
+                
+                for pos in nonzero_positions[1:]:
+                    if not torch.equal(first_nonzero, dec_tokens[0, pos, :]):
+                        all_nonzero_same = False
+                        print(f'Position {pos} differs from position {nonzero_positions[0]}')
+                        break
+                
+                print(f'All non-zero positions identical? {all_nonzero_same}')
 
             # ------------------------------------------------------------------
             # Forward pass: encoder context -> decoder (hook captures block-8)
             # ------------------------------------------------------------------
             context = model._encode(enc_tokens, enc_emb, enc_mask)
 
-            _ = model._decode(
+            decoder_output = model._decode(
                 context,
                 enc_mask,
                 dec_tokens,
@@ -169,14 +450,58 @@ def collect_activations_with_raw_data_mapping(
                 dec_att_mask,
             )  # hook fires here
 
-            # Store the decoder tokens that were processed AND the actual tokens for mapping
+            # ------------------------------------------------------------------
+            # COMPUTE ACTUAL PREDICTIONS (logits -> predicted token IDs)
+            # ------------------------------------------------------------------
+            if batch_idx == 0:  # Only for first batch to see predictions
+                print(f"\n=== MODEL PREDICTIONS ===")
+                mod_logits = {}
+                predicted_tokens = {}
+                
+                for mod in target_mask.keys():
+                    idx = model.modality_info[mod]["id"]
+                    
+                    # Get positions for this modality in the decoder output
+                    mod_positions = (dec_mod_mask == idx)
+                    if mod_positions.any():
+                        # Compute logits for this modality
+                        mod_decoder_output = decoder_output[mod_positions]  # Shape: (num_positions, hidden_dim)
+                        mod_logits[mod] = model.decoder_embeddings[mod].forward_logits(mod_decoder_output)
+                        
+                        # Convert logits to predicted token IDs
+                        predicted_tokens[mod] = torch.argmax(mod_logits[mod], dim=-1)  # Shape: (num_positions,)
+                        
+                        # Get actual ground truth for comparison
+                        actual_tokens_for_mod = processed_batch[mod]["tensor"][0]  # First sample
+                        target_mask_for_mod = target_mask[mod][0]  # First sample
+                        
+                        print(f"\nModality {mod}:")
+                        print(f"  Predicted tokens (first 10): {predicted_tokens[mod][:10].tolist()}")
+                        print(f"  Actual tokens    (first 10): {actual_tokens_for_mod[:10].tolist()}")
+                        
+                        # Show predictions specifically for masked positions (what model was trying to predict)
+                        masked_positions = ~target_mask_for_mod  # False = positions to predict
+                        if masked_positions.any():
+                            actual_masked = actual_tokens_for_mod[masked_positions]
+                            # Map decoder positions back to original positions for this modality
+                            first_sample_mod_mask = dec_mod_mask[0] == idx
+                            if first_sample_mod_mask.sum() > 0:
+                                pred_for_masked = predicted_tokens[mod]
+                                print(f"  Predictions for masked positions: {pred_for_masked[:min(10, len(pred_for_masked))].tolist()}")
+                                print(f"  Ground truth for masked positions: {actual_masked[:min(10, len(actual_masked))].tolist()}")
+                            
+                                # Calculate accuracy for masked predictions
+                                if len(pred_for_masked) >= len(actual_masked):
+                                    matches = (pred_for_masked[:len(actual_masked)] == actual_masked.to(pred_for_masked.device)).sum().item()
+                                    accuracy = matches / len(actual_masked)
+                                    print(f"  Accuracy on masked positions: {accuracy:.3f} ({matches}/{len(actual_masked)})")
+                
+                print(f"=== END MODEL PREDICTIONS ===\n")
+
+            # Store the decoder tokens that were processed
             decoder_tokens_cache[batch_idx] = {
-                'dec_tokens': dec_tokens.detach().cpu(),  # Shape: (batch_size, seq_len, embed_dim) - what decoder saw
                 'target_ids': target_ids.detach().cpu(),  # Shape: (batch_size, seq_len) - what decoder saw (mostly zeros)
-                'dec_mod_mask': dec_mod_mask.detach().cpu(),  # Modality labels for each token
                 'decoder_mask': dec_mask.detach().cpu(),  # Boolean mask indicating which tokens were masked (True) or kept (False)
-                'actual_tokens': {mod: tokens.detach().cpu() for mod, tokens in actual_tokens_at_positions.items()},  # NEW: actual tokens
-                'target_mask': {mod: mask.detach().cpu() for mod, mask in target_mask.items()},  # NEW: masks for mapping
                 'batch_size': dec_tokens.shape[0],
                 'seq_len': dec_tokens.shape[1],
             }
@@ -233,81 +558,7 @@ def collect_activations_with_raw_data_mapping(
     
     return activations_tensor_flat, modality_labels_flat, sample_mapping, decoder_tokens_cache, original_batch_cache
 
-def extract_raw_value_from_original_data(batch_idx, sample_idx, modality_name, original_batch_cache):
-    """
-    Extract the raw pre-tokenization value(s) for a specific sample and modality.
-    
-    Args:
-        batch_idx: Which batch this sample came from
-        sample_idx: Which sample within the batch
-        modality_name: Name of the modality (e.g., 'tok_flux_g')
-        original_batch_cache: Cache of original batch data
-        
-    Returns:
-        dict with raw value information
-    """
-    if batch_idx not in original_batch_cache:
-        return {'error': 'Batch not found in original data cache'}
-    
-    batch_data = original_batch_cache[batch_idx]
-    
-    if modality_name not in batch_data:
-        return {'error': f'Modality {modality_name} not found in batch {batch_idx}'}
-    
-    modality_data = batch_data[modality_name]
-    tensor = modality_data['tensor']  # Shape varies by modality
-    
-    # Extract data for this specific sample
-    if sample_idx >= tensor.shape[0]:
-        return {'error': f'Sample index {sample_idx} out of bounds for batch size {tensor.shape[0]}'}
-    
-    sample_tensor = tensor[sample_idx]  # Remove batch dimension
-    
-    # Handle different modality types
-    result = {
-        'modality_name': modality_name,
-        'original_shape': list(sample_tensor.shape),
-        'tensor_dtype': str(sample_tensor.dtype),
-    }
-    
-    if sample_tensor.ndim == 0:
-        # Scalar value (e.g., single flux measurement, redshift)
-        result['raw_value'] = float(sample_tensor.item())
-        result['value_type'] = 'scalar'
-        
-    elif sample_tensor.ndim == 1:
-        # 1D array (e.g., spectrum, flux measurements)
-        result['raw_values'] = sample_tensor.tolist()
-        result['value_type'] = 'array_1d'
-        result['array_length'] = sample_tensor.shape[0]
-        # Show first few values for preview
-        result['preview_values'] = sample_tensor[:min(10, len(sample_tensor))].tolist()
-        
-    elif sample_tensor.ndim == 2:
-        # 2D array (e.g., image patches)
-        result['raw_values'] = sample_tensor.tolist()  # Full 2D array
-        result['value_type'] = 'array_2d'
-        result['array_shape'] = list(sample_tensor.shape)
-        # Show corner for preview
-        preview_size = min(5, sample_tensor.shape[0]), min(5, sample_tensor.shape[1])
-        result['preview_corner'] = sample_tensor[:preview_size[0], :preview_size[1]].tolist()
-        
-    elif sample_tensor.ndim == 3:
-        # 3D array (e.g., multi-channel image patches)
-        result['value_type'] = 'array_3d'
-        result['array_shape'] = list(sample_tensor.shape)
-        # Don't store full 3D array (too large), just metadata and preview
-        result['preview_slice'] = sample_tensor[0, :min(5, sample_tensor.shape[1]), :min(5, sample_tensor.shape[2])].tolist()
-        
-    else:
-        # Higher dimensional - just store metadata
-        result['value_type'] = f'array_{sample_tensor.ndim}d'
-        result['array_shape'] = list(sample_tensor.shape)
-        result['note'] = 'high_dimensional_array_not_fully_stored'
-    
-    return result
-
-def get_exact_decoder_token_info(global_token_idx, sample_mapping, decoder_tokens_cache, original_batch_cache=None, model=None):
+def get_exact_decoder_token_info(global_token_idx, sample_mapping, decoder_tokens_cache, original_batch_cache=None, model=None, modality_labels_flat=None):
     """
     Get the exact decoder token ID, modality, AND raw pre-tokenization value for a given activation index.
     Now correctly handles masked tokens vs actual tokens for proper SAE analysis.
@@ -315,9 +566,10 @@ def get_exact_decoder_token_info(global_token_idx, sample_mapping, decoder_token
     Args:
         global_token_idx: Index into the flattened activation tensor
         sample_mapping: Mapping from token indices to sample info  
-        decoder_tokens_cache: Cache of actual decoder tokens processed
+        decoder_tokens_cache: Cache of decoder tokens processed (target_ids, decoder_mask)
         original_batch_cache: Cache of original batch data before tokenization
         model: Model for accessing modality info
+        modality_labels_flat: Flattened modality labels for each token position
         
     Returns:
         dict with exact token information AND raw values
@@ -336,11 +588,7 @@ def get_exact_decoder_token_info(global_token_idx, sample_mapping, decoder_token
         return {'error': f'Decoder tokens not cached for batch {batch_idx}'}
     
     batch_cache = decoder_tokens_cache[batch_idx]
-    dec_tokens = batch_cache['dec_tokens']  # Shape: (batch_size, seq_len, embed_dim) - what decoder saw
-    dec_mod_mask = batch_cache['dec_mod_mask']  # Shape: (batch_size, seq_len)
     target_ids = batch_cache['target_ids']  # Shape: (batch_size, seq_len) - what decoder saw (mostly zeros)
-    actual_tokens = batch_cache['actual_tokens']  # Dict of actual tokens per modality
-    target_masks = batch_cache['target_mask']  # Dict of masks per modality
     
     # Extract the specific token
     if sample_idx >= target_ids.shape[0] or token_position >= target_ids.shape[1]:
@@ -349,8 +597,8 @@ def get_exact_decoder_token_info(global_token_idx, sample_mapping, decoder_token
     # Get what the decoder actually saw at this position (likely 0 if masked)
     decoder_saw_token_id = int(target_ids[sample_idx, token_position].item())
     
-    # Get modality ID from dec_mod_mask
-    modality_id = int(dec_mod_mask[sample_idx, token_position].item())
+    # Get modality ID from modality_labels_flat
+    modality_id = int(modality_labels_flat[global_token_idx].item()) if modality_labels_flat is not None else -1
     
     # Get modality name
     if modality_id == -1:
@@ -377,21 +625,44 @@ def get_exact_decoder_token_info(global_token_idx, sample_mapping, decoder_token
             decoder_mask = decoder_mask.squeeze(1)  # -> (B, M)
         was_masked = bool(decoder_mask[sample_idx, token_position].item())
     
-    # If we have access to the original token sequence for this modality we can attempt to fetch it
-    if (
-        was_masked is not None
-        and modality_name in actual_tokens
-        and sample_idx < actual_tokens[modality_name].shape[0]
-    ):
-        # Map token_position within the flattened decoder sequence back into the modality sequence
-        # by using dec_mod_mask equality.
-        modality_positions = (dec_mod_mask[sample_idx] == modality_id).nonzero(as_tuple=False).squeeze(-1)
-        if token_position in modality_positions:
-            # Index into modality_positions array to find offset inside modality sequence
-            idx_in_modality = (modality_positions == token_position).nonzero(as_tuple=False).item()
-            seq_len_mod = actual_tokens[modality_name].shape[1]
-            if idx_in_modality < seq_len_mod:
-                actual_token_id = int(actual_tokens[modality_name][sample_idx, idx_in_modality].item())
+    # Get the actual token from original_batch_cache
+    if (original_batch_cache is not None 
+        and batch_idx in original_batch_cache 
+        and modality_name in original_batch_cache[batch_idx]
+        and sample_idx < original_batch_cache[batch_idx][modality_name]['tensor'].shape[0]):
+        
+        # Get the flattened sequence position and map back to modality position
+        # We need to find which position within this modality this token corresponds to
+        
+        # Calculate how many tokens come before this position from other modalities in this batch
+        total_tokens_before = 0
+        for b_idx in range(batch_idx):
+            if b_idx in decoder_tokens_cache:
+                total_tokens_before += decoder_tokens_cache[b_idx]['batch_size'] * decoder_tokens_cache[b_idx]['seq_len']
+        
+        # Add tokens from previous samples in this batch
+        total_tokens_before += sample_idx * decoder_tokens_cache[batch_idx]['seq_len']
+        
+        # The position within this sample's decoder sequence
+        position_in_sample = global_token_idx - total_tokens_before
+        
+        # Find positions in the decoder sequence that belong to this modality
+        sample_start_idx = total_tokens_before
+        sample_end_idx = sample_start_idx + decoder_tokens_cache[batch_idx]['seq_len']
+        
+        if modality_labels_flat is not None:
+            # Get modality labels for this sample
+            sample_modality_labels = modality_labels_flat[sample_start_idx:sample_end_idx]
+            modality_positions = (sample_modality_labels == modality_id).nonzero(as_tuple=False).squeeze(-1)
+            
+            if token_position in modality_positions:
+                # Find the index within the modality sequence
+                idx_in_modality = (modality_positions == token_position).nonzero(as_tuple=False).item()
+                
+                # Get the actual token from original batch cache
+                original_tensor = original_batch_cache[batch_idx][modality_name]['tensor']
+                if idx_in_modality < original_tensor.shape[1]:  # Check bounds
+                    actual_token_id = int(original_tensor[sample_idx, idx_in_modality].item())
     
     result = {
         'decoder_saw_token_id': decoder_saw_token_id,  # What decoder actually processed (likely 0 if masked)
@@ -405,37 +676,36 @@ def get_exact_decoder_token_info(global_token_idx, sample_mapping, decoder_token
         'decoder_sequence_length': target_ids.shape[1],
     }
     
-    # Extract raw pre-tokenization values using the actual token (not what decoder saw)
-    if original_batch_cache is not None and actual_token_id is not None:
-        raw_value_info = extract_raw_value_from_original_data(
-            batch_idx, sample_idx, modality_name, original_batch_cache
-        )
+    # Extract raw tensor data directly from original_batch_cache
+    if (original_batch_cache is not None 
+        and batch_idx in original_batch_cache 
+        and modality_name in original_batch_cache[batch_idx]
+        and sample_idx < original_batch_cache[batch_idx][modality_name]['tensor'].shape[0]):
         
-        # Add raw value info to result with clear prefixes
-        for key, value in raw_value_info.items():
-            result[f'raw_{key}'] = value
-            
-        # Also add some convenient extracted fields for CSV
-        if 'raw_value' in raw_value_info:
-            result['raw_scalar_value'] = raw_value_info['raw_value']
-        elif 'raw_values' in raw_value_info and isinstance(raw_value_info['raw_values'], list):
-            # For arrays, maybe show the first value or some summary
-            if len(raw_value_info['raw_values']) > 0:
-                result['raw_first_value'] = raw_value_info['raw_values'][0]
-                result['raw_array_length'] = len(raw_value_info['raw_values'])
+        raw_tensor = original_batch_cache[batch_idx][modality_name]['tensor'][sample_idx]
         
-        # Add a human-readable summary
-        if raw_value_info.get('value_type') == 'scalar':
-            result['raw_value_summary'] = f"scalar: {raw_value_info.get('raw_value', 'N/A')}"
-        elif raw_value_info.get('value_type') == 'array_1d':
-            length = raw_value_info.get('array_length', 0)
-            first_val = raw_value_info.get('preview_values', [None])[0]
-            result['raw_value_summary'] = f"1D array[{length}], starts with: {first_val}"
-        elif raw_value_info.get('value_type') == 'array_2d':
-            shape = raw_value_info.get('array_shape', [])
-            result['raw_value_summary'] = f"2D array{shape}"
+        # Add tensor metadata
+        result['raw_tensor_shape'] = list(raw_tensor.shape)
+        result['raw_tensor_dtype'] = str(raw_tensor.dtype)
+        
+        # Handle different tensor types for CSV-friendly output
+        if raw_tensor.ndim == 0:
+            # Scalar value
+            result['raw_value'] = float(raw_tensor.item())
+            result['raw_value_summary'] = f"scalar: {result['raw_value']}"
+        elif raw_tensor.ndim == 1:
+            # 1D array
+            result['raw_first_value'] = float(raw_tensor[0].item()) if len(raw_tensor) > 0 else None
+            result['raw_array_length'] = raw_tensor.shape[0]
+            result['raw_value_summary'] = f"1D array[{raw_tensor.shape[0]}], starts with: {result['raw_first_value']}"
+        elif raw_tensor.ndim == 2:
+            # 2D array
+            result['raw_array_shape'] = list(raw_tensor.shape)
+            result['raw_value_summary'] = f"2D array{list(raw_tensor.shape)}"
         else:
-            result['raw_value_summary'] = f"{raw_value_info.get('value_type', 'unknown')}"
+            # Higher dimensional
+            result['raw_array_shape'] = list(raw_tensor.shape)
+            result['raw_value_summary'] = f"{raw_tensor.ndim}D array{list(raw_tensor.shape)}"
     else:
         result['raw_value_summary'] = 'original_data_not_available'
     
@@ -530,17 +800,6 @@ def top_k_inputs_for_sae_latent_neuron_n(
     # Sort results by activation value (descending)
     top_k_results = sorted(top_k_heap, key=lambda x: x[0], reverse=True)
     
-    # DEBUG: Check for activation diversity
-    unique_activations = len(set([x[0] for x in top_k_results]))
-    print(f"DEBUG: Found {unique_activations} unique activation values among top-{k} results")
-    if unique_activations < 5:
-        print(f"WARNING: Very few unique activations - this suggests potential issues:")
-        for i, (act_val, _) in enumerate(top_k_results[:5]):
-            print(f"  Rank {i+1}: {act_val}")
-    
-    print(f"Found top-{k} activating tokens for latent {latent_neuron_n}")
-    print(f"Activation range: {top_k_results[-1][0]:.6f} to {top_k_results[0][0]:.6f}")
-    
     # Create detailed results with exact decoder token information AND raw values
     results = []
     
@@ -563,7 +822,7 @@ def top_k_inputs_for_sae_latent_neuron_n(
         # Add exact decoder token information AND raw values
         if sample_mapping is not None and decoder_tokens_cache is not None:
             token_info = get_exact_decoder_token_info(
-                global_token_idx, sample_mapping, decoder_tokens_cache, original_batch_cache, model
+                global_token_idx, sample_mapping, decoder_tokens_cache, original_batch_cache, model, modality_labels_flat
             )
             result.update(token_info)
         else:
@@ -583,156 +842,51 @@ def top_k_inputs_for_sae_latent_neuron_n(
     # Create DataFrame and save CSV
     df = pd.DataFrame(results)
     
-    # DEBUG: Show sample and modality diversity
-    print(f"\n=== Debugging: Sample and Modality Diversity ===")
-    if 'batch_idx' in df.columns and 'sample_idx' in df.columns:
-        unique_samples = df[['batch_idx', 'sample_idx']].drop_duplicates()
-        print(f"Unique samples represented: {len(unique_samples)}/{len(df)}")
-        print("Sample distribution:")
-        sample_counts = df.groupby(['batch_idx', 'sample_idx']).size().head(10)
-        for (batch, sample), count in sample_counts.items():
-            print(f"  Batch {batch}, Sample {sample}: {count} tokens")
-    
-    if 'modality_name' in df.columns:
-        modality_counts = df['modality_name'].value_counts()
-        print(f"Modality distribution: {dict(modality_counts)}")
-    
-    if 'was_masked_for_prediction' in df.columns:
-        mask_counts = df['was_masked_for_prediction'].value_counts()
-        print(f"Mask status: {dict(mask_counts)}")
-    
-    # Print first few results to verify - now with masked vs actual token info!
-    print("\n=== Top 3 Results (Masked Token Prediction Analysis) ===")
-    for i in range(min(3, len(df))):
-        row = df.iloc[i]
-        decoder_saw = row.get('decoder_saw_token_id', 'N/A')
-        actual_token = row.get('actual_token_id', 'N/A')
-        was_masked = row.get('was_masked_for_prediction', 'N/A')
-        raw_summary = row.get('raw_value_summary', 'N/A')
-        
-        print(f"Rank {row['rank']}: Decoder saw token {decoder_saw}, actual token was {actual_token}")
-        print(f"   Modality: {row['modality_name']}, Was masked for prediction: {was_masked}")
-        print(f"   Activation: {row['activation_value']:.6f}")
-        print(f"   Raw value: {raw_summary}")
-        print()
-    
-    # Count masked vs non-masked predictions
-    if 'was_masked_for_prediction' in df.columns:
-        masked_count = df['was_masked_for_prediction'].sum() if df['was_masked_for_prediction'].dtype == bool else (df['was_masked_for_prediction'] == True).sum()
-        print(f"Analysis summary: {masked_count}/{len(df)} top activations came from masked token prediction positions")
-    
     # Save results
     csv_filename = f"{filename_prefix}latent_{latent_neuron_n}_top_{k}_masked_prediction_analysis.csv"
     csv_path = out_dir / csv_filename
     df.to_csv(csv_path, index=False)
     print(f"Results saved to: {csv_path}")
     
-    # ================================================================
-    # NEW: Save an additional CSV focused solely on the query tokens
-    # (i.e., positions that were masked for prediction) so that we can
-    # inspect exactly which inputs triggered the strongest response in
-    # latent neuron 0.
-    # ================================================================
+    # # ================================================================
+    # # NEW: Save an additional CSV focused solely on the query tokens
+    # # (i.e., positions that were masked for prediction) so that we can
+    # # inspect exactly which inputs triggered the strongest response in
+    # # latent neuron 0.
+    # # ================================================================
 
-    if 'was_masked_for_prediction' in df.columns:
-        df_query_tokens = df[df['was_masked_for_prediction'] == True].copy()
+    # if 'was_masked_for_prediction' in df.columns:
+    #     df_query_tokens = df[df['was_masked_for_prediction'] == True].copy()
 
-        print(f"[INFO] Identified {len(df_query_tokens)} masked (query) tokens within the initial top-{k} set.")
+    #     print(f"[INFO] Identified {len(df_query_tokens)} masked (query) tokens within the initial top-{k} set.")
 
-        # Sort by activation value and keep only the top 10
-        top_query_k = 10
-        df_query_tokens = df_query_tokens.sort_values('activation_value', ascending=False).head(top_query_k)
+    #     # Sort by activation value and keep only the top 10
+    #     top_query_k = 10
+    #     df_query_tokens = df_query_tokens.sort_values('activation_value', ascending=False).head(top_query_k)
 
-        # Keep only the columns required by the user
-        desired_columns = [
-            'global_token_index',
-            'modality_name',
-            'modality_id',
-            'activation_value'
-        ]
-        missing_cols = [c for c in desired_columns if c not in df_query_tokens.columns]
-        if missing_cols:
-            print(f"[WARNING] The following expected columns were not found in the DataFrame and will be skipped: {missing_cols}")
-        exported_columns = [c for c in desired_columns if c in df_query_tokens.columns]
+    #     # Keep only the columns required by the user
+    #     desired_columns = [
+    #         'global_token_index',
+    #         'modality_name',
+    #         'modality_id',
+    #         'activation_value'
+    #     ]
+    #     missing_cols = [c for c in desired_columns if c not in df_query_tokens.columns]
+    #     if missing_cols:
+    #         print(f"[WARNING] The following expected columns were not found in the DataFrame and will be skipped: {missing_cols}")
+    #     exported_columns = [c for c in desired_columns if c in df_query_tokens.columns]
 
-        df_query_export = df_query_tokens[exported_columns]
+    #     df_query_export = df_query_tokens[exported_columns]
 
-        query_csv_filename = f"{filename_prefix}latent_{latent_neuron_n}_top_{top_query_k}_query_tokens.csv"
-        query_csv_path = out_dir / query_csv_filename
-        df_query_export.to_csv(query_csv_path, index=False)
+    #     query_csv_filename = f"{filename_prefix}latent_{latent_neuron_n}_top_{top_query_k}_query_tokens.csv"
+    #     query_csv_path = out_dir / query_csv_filename
+    #     df_query_export.to_csv(query_csv_path, index=False)
 
-        print(f"[INFO] Top-{top_query_k} query tokens saved (masked prediction positions only): {query_csv_path}")
-        print("[INFO] Preview of the saved query-token CSV:")
-        print(df_query_export.head())
-    else:
-        print("[WARNING] 'was_masked_for_prediction' column missing – cannot create query-token specific CSV.")
-    
-    # Create visualizations if requested
-    if create_plots and modality_labels_flat is not None:
-        fig, ((ax1, ax2), (ax3, ax4)) = plt.subplots(2, 2, figsize=(15, 12))
-        
-        # Plot 1: Histogram of activation values
-        ax1.hist(df['activation_value'], bins=20, alpha=0.7, color='skyblue', edgecolor='black')
-        ax1.set_xlabel('Activation Value')
-        ax1.set_ylabel('Frequency')
-        ax1.set_title(f'Distribution of Top-{k} Activation Values\n(Latent Neuron {latent_neuron_n})')
-        ax1.grid(True, alpha=0.3)
-        
-        # Plot 2: Count by modality type
-        if 'modality_name' in df.columns:
-            modality_counts = df['modality_name'].value_counts()
-            ax2.bar(range(len(modality_counts)), modality_counts.values, color='lightcoral')
-            ax2.set_xlabel('Modality Type')
-            ax2.set_ylabel('Count')
-            ax2.set_title(f'Top-{k} Activations by Modality Type\n(Latent Neuron {latent_neuron_n})')
-            ax2.set_xticks(range(len(modality_counts)))
-            ax2.set_xticklabels(modality_counts.index, rotation=45, ha='right')
-            ax2.grid(True, alpha=0.3)
-        
-        # Plot 3: Masked vs Non-masked predictions
-        if 'was_masked_for_prediction' in df.columns:
-            mask_counts = df['was_masked_for_prediction'].value_counts()
-            # Create dynamic labels based on actual data
-            labels = []
-            colors = []
-            for val in mask_counts.index:
-                if val == True:
-                    labels.append('Masked')
-                    colors.append('orange')
-                else:
-                    labels.append('Non-masked') 
-                    colors.append('lightgreen')
-            ax3.pie(mask_counts.values, labels=labels, autopct='%1.1f%%', colors=colors)
-            ax3.set_title(f'Masked vs Non-masked Predictions\n(Latent Neuron {latent_neuron_n})')
-        
-        # Plot 4: Activation values for masked vs non-masked
-        if 'was_masked_for_prediction' in df.columns:
-            masked_activations = df[df['was_masked_for_prediction'] == True]['activation_value']
-            non_masked_activations = df[df['was_masked_for_prediction'] == False]['activation_value']
-            
-            # Only plot if we have data for each category
-            if len(masked_activations) > 0:
-                ax4.hist(masked_activations, bins=10, alpha=0.7, label='Masked predictions', color='orange')
-            if len(non_masked_activations) > 0:
-                ax4.hist(non_masked_activations, bins=10, alpha=0.7, label='Non-masked', color='lightgreen')
-            
-            # Only show legend if we actually plotted something
-            if len(masked_activations) > 0 or len(non_masked_activations) > 0:
-                ax4.legend()
-            
-            ax4.set_xlabel('Activation Value')
-            ax4.set_ylabel('Frequency')
-            ax4.set_title(f'Activation Distribution by Mask Status\n(Latent Neuron {latent_neuron_n})')
-            ax4.grid(True, alpha=0.3)
-        
-        plt.tight_layout()
-        
-        # Save plot
-        plot_filename = f"{filename_prefix}latent_{latent_neuron_n}_top_{k}_masked_prediction_analysis.png"
-        plot_path = out_dir / plot_filename
-        plt.savefig(plot_path, dpi=300, bbox_inches='tight')
-        plt.close()
-        print(f"Visualization saved to: {plot_path}")
+    #     print(f"[INFO] Top-{top_query_k} query tokens saved (masked prediction positions only): {query_csv_path}")
+    #     print("[INFO] Preview of the saved query-token CSV:")
+    #     print(df_query_export.head())
+    # else:
+    #     print("[WARNING] 'was_masked_for_prediction' column missing – cannot create query-token specific CSV.")
     
     return df
 	
