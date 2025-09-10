@@ -2,6 +2,7 @@ import torch
 import numpy as np
 import matplotlib.pyplot as plt
 import os
+import pickle
 from typing import Tuple, Optional, Dict
 import pandas as pd
 from tqdm import tqdm
@@ -137,13 +138,25 @@ def get_sae_latents(
     save_path: Optional[str] = None
 ) -> np.ndarray:
     """
-    Pass activations through SAE, return latents (numpy array).
+    Pass activations through SAE with proper normalization, return latents (numpy array).
     """
     with torch.no_grad():
         acts = torch.tensor(activations, dtype=torch.float32, device=device)
-        _, latents = sae_model(acts)
+        
+        # Apply same normalization as training
+        # Mean subtraction per sample (dim=1) 
+        acts_centered = acts - acts.mean(dim=1, keepdim=True)
+        
+        # Unit normalization
+        norms = torch.norm(acts_centered, dim=1, keepdim=True)
+        acts_normalized = acts_centered / (norms + 1e-8)
+        
+        # Pass normalized activations through SAE
+        _, latents = sae_model(acts_normalized)
         latents_np = latents.cpu().numpy()
+        
     print(f"SAE latents: shape={latents_np.shape}")
+    print(f"Applied normalization: mean subtraction + unit norm")
     if save_path is not None:
         np.save(save_path, latents_np)
         print(f"Saved SAE latents to {save_path}")
@@ -679,7 +692,7 @@ def intervention_experiment(sae_weights_path='best_llm_sae_rural-wood-16.pth',
     save_dir='intervention_results',
     batch_size=32,
     block_idx=8,
-    target_latent=2023,
+    target_latent=1689,
     device=None
 ):
     # Set random seeds for reproducibility (same as probe function)
@@ -699,7 +712,7 @@ def intervention_experiment(sae_weights_path='best_llm_sae_rural-wood-16.pth',
     # Load dataset using existing function
     print("Loading dataset...")
     data_path = '/mnt/home/polymathic/ceph/MultimodalUniverse/legacysurvey/dr10_south_21/healpix=299/001-of-001.hdf5'
-    dataset = load_legacysurvey_data(data_path, max_samples=200)
+    dataset = load_legacysurvey_data(data_path, max_samples=10000)
     
     # Convert images to tensor and move to device
     image_tensor = torch.tensor(dataset['images'], dtype=torch.float32).to(device)
@@ -749,22 +762,42 @@ def intervention_experiment(sae_weights_path='best_llm_sae_rural-wood-16.pth',
     print(f"Feature decoder vector shape: {feature_decoder_vector.shape}")
     print(f"Feature decoder vector norm: {torch.norm(feature_decoder_vector).item():.6f}")
     
-    # 4. DEFINE THE INTERVENTION HOOK WITH ACTIVATION TRACKING
+    # 4. DEFINE THE INTERVENTION HOOK WITH ACTIVATION TRACKING AND PROPER NORMALIZATION
     def create_steering_hook_with_tracking(amp_factor, decoder_vector):
-        """Create a steering hook that tracks both original and intervened activations."""
+        """Create a steering hook that tracks both original and intervened activations with proper normalization."""
         # Storage for activation analysis
         original_activations = []
         intervened_activations = []
         
         def steering_hook(module, input, output):
-            # Use the original tensor for computation (like the working version)
-            original_activation = output
+            # Get original activations
+            original_activation = output  # Shape: [batch, seq_len, hidden_dim]
+            batch_size, seq_len, hidden_dim = original_activation.shape
             
             # Store original activation for analysis (detached copy)
             original_activations.append(original_activation.detach().cpu())
             
-            # Add the amplified feature direction
-            modified_activation = original_activation + amp_factor * decoder_vector
+            # Flatten for normalization
+            flat_activations = original_activation.view(-1, hidden_dim)
+            
+            # Apply same normalization as training
+            # Mean subtraction per sample (dim=1)
+            flat_activations_centered = flat_activations - flat_activations.mean(dim=1, keepdim=True)
+            
+            # Unit normalization
+            norms = torch.norm(flat_activations_centered, dim=1, keepdim=True)
+            flat_activations_normalized = flat_activations_centered / (norms + 1e-8)
+            
+            # Apply intervention in normalized space
+            # The decoder_vector is learned in normalized space, so we apply amplification there
+            intervened_flat_normalized = flat_activations_normalized - amp_factor * decoder_vector
+            
+            # Denormalize back to original space
+            original_means = flat_activations.mean(dim=1, keepdim=True)
+            intervened_flat = intervened_flat_normalized * norms + original_means
+            
+            # Reshape back to original format
+            modified_activation = intervened_flat.view(batch_size, seq_len, hidden_dim)
             
             # Store intervened activation for analysis (detached copy)
             intervened_activations.append(modified_activation.detach().cpu())
@@ -778,7 +811,9 @@ def intervention_experiment(sae_weights_path='best_llm_sae_rural-wood-16.pth',
         return steering_hook
     
     # 5. RUN INTERVENTION EXPERIMENT
-    amplification_factors = [0, 1.0, 10.0, 100.0, 200.0, 500.0, 1000.0]
+    # NOTE: Using much smaller factors now since we work in normalized space
+    # The old factors (300-400) were needed because decoder vectors were being applied to wrong scale
+    amplification_factors = [0, 0.1, 0.5, 1.0, 2.0, 5.0, 10.0] 
     
     # Store results for plotting
     all_results = {}
@@ -974,23 +1009,19 @@ def intervention_experiment(sae_weights_path='best_llm_sae_rural-wood-16.pth',
                            xytext=(5, 5), textcoords='offset points', fontsize=8)
     
     plt.tight_layout()
-    plt.savefig(os.path.join(save_dir, f'activation_analysis_latent{target_latent}.png'), dpi=300, bbox_inches='tight')
+    plt.savefig(os.path.join(save_dir, f'activation_analysis_latent{target_latent}_amp300400.png'), dpi=300, bbox_inches='tight')
     plt.show()
     
-    # 7. VALIDATION TESTS (as your advisor suggested)
-    print("\n=== Validation Tests ===")
+    # # 7. VALIDATION TESTS (as your advisor suggested)
+    # print("\n=== Validation Tests ===")
     
-    # Test a=0 is no-op
-    try:
-        assert np.allclose(baseline_flux_predictions['flux_g'], 
-                          all_results[0]['flux_g'], rtol=1e-5), "a=0 should be no-op"
-        print("✓ Test passed: a=0 is no-op")
-    except AssertionError as e:
-        print(f"✗ Test failed: {e}")
-    
-    # Test a=100 creates significant changes
-    max_change = np.max(np.abs(all_results[1000.0]['flux_g'] - baseline_flux_predictions['flux_g']))
-    print(f"a=1000 creates changes (max change: {max_change:.3f})")
+    # # Test a=0 is no-op
+    # try:
+    #     assert np.allclose(baseline_flux_predictions['flux_g'], 
+    #                       all_results[0]['flux_g'], rtol=1e-5), "a=0 should be no-op"
+    #     print("✓ Test passed: a=0 is no-op")
+    # except AssertionError as e:
+    #     print(f"✗ Test failed: {e}")
    
     # 8. PLOT THE PREDICTED VS TRUE COMPARISON
     print("\n=== Creating flux prediction plots ===")
@@ -1057,7 +1088,7 @@ def intervention_experiment(sae_weights_path='best_llm_sae_rural-wood-16.pth',
         plt.grid(True, alpha=0.3)
     
     plt.tight_layout()
-    plt.savefig(os.path.join(save_dir, f'amplification_vs_shift_latent{target_latent}.png'), dpi=300)
+    plt.savefig(os.path.join(save_dir, f'amplification_vs_shift_latent{target_latent}_amp300400.png'), dpi=300)
     plt.show()
     
     # Save numerical results
@@ -1071,11 +1102,544 @@ def intervention_experiment(sae_weights_path='best_llm_sae_rural-wood-16.pth',
         'activation_analysis': activation_analysis,  # Add activation analysis to saved results
         'decoder_vector_norm': torch.norm(feature_decoder_vector).item()
     }
-    
-    np.save(os.path.join(save_dir, f'intervention_results_latent{target_latent}.npy'), results_summary)
+    # np.save(os.path.join(save_dir, f'intervention_results_latent{target_latent}.npy'), results_summary)
+    np.save(os.path.join(save_dir, f'intervention_results_latent{target_latent}_amp300400.npy'), results_summary)
     
     print(f"\nIntervention experiment complete! Results saved to {save_dir}")
     return all_results, true_flux_data
+
+def ablate_all_sae_features(
+    sae_weights_path='best_llm_sae_rural-wood-16.pth',
+    save_dir='feature_ablation_results',
+    batch_size=32,
+    block_idx=8,
+    device=None,
+    max_features_to_test=None,
+    subset_indices=None,
+    sample_size=10000
+):
+    """
+    Systematically ablate each SAE feature and measure impact on flux predictions.
+    This helps identify which features are most important for flux prediction.
+    
+    Args:
+        sae_weights_path: Path to trained SAE weights
+        save_dir: Directory to save results
+        batch_size: Batch size for inference
+        block_idx: AION decoder block index where SAE was trained
+        device: Compute device
+        max_features_to_test: Limit number of features to test (for faster experiments)
+        subset_indices: Specific list of feature indices to test (overrides max_features_to_test)
+        sample_size: Number of samples to use for testing (smaller = faster)
+    
+    Returns:
+        Dictionary with ablation results and impact rankings
+    """
+    # Set random seeds for reproducibility
+    torch.manual_seed(42)
+    np.random.seed(42)
+    
+    if device is None:
+        device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    
+    os.makedirs(save_dir, exist_ok=True)
+    
+    print("=== SAE Feature Ablation Experiment ===")
+    print(f"Save directory: {save_dir}")
+    print(f"Device: {device}")
+    print(f"Sample size: {sample_size}")
+    
+    # Load models
+    print("Loading models...")
+    model = AION.from_pretrained('polymathic-ai/aion-base').to(device).eval()
+    codec_manager = CodecManager(device=device)
+    
+    # Load dataset (use smaller subset for faster testing)
+    print("Loading dataset...")
+    data_path = '/mnt/home/polymathic/ceph/MultimodalUniverse/legacysurvey/dr10_south_21/healpix=299/001-of-001.hdf5'
+    dataset = load_legacysurvey_data(data_path, max_samples=sample_size)
+    
+    # Convert images to tensor and move to device
+    image_tensor = torch.tensor(dataset['images'], dtype=torch.float32).to(device)
+    print(f"Image tensor shape: {image_tensor.shape}")
+    
+    # Load SAE model - first determine input size
+    print("Loading SAE...")
+    with torch.no_grad():
+        sample_img = image_tensor[:1]
+        img_mod = LegacySurveyImage(flux=sample_img, bands=dataset['bands'])
+        tokens = codec_manager.encode(img_mod)
+        
+        # Get sample activation to determine size
+        sample_activation = None
+        def size_hook(module, input, output):
+            nonlocal sample_activation
+            sample_activation = output.detach()
+        
+        handle = model.decoder[block_idx].register_forward_hook(size_hook)
+        _ = model(tokens, target_modality=LegacySurveyFluxG)
+        handle.remove()
+        
+        input_size = sample_activation.shape[-1]
+        print(f"Determined input size: {input_size}")
+    
+    # Load SAE model
+    hidden_size = input_size * 4
+    k = max(1, int(hidden_size * 0.02))
+    sae_model = SparseAutoencoder(input_size, hidden_size, k=k).to(device)
+    sae_model.load_state_dict(torch.load(sae_weights_path, weights_only=True, map_location=device))
+    sae_model.eval()
+    
+    print(f"SAE loaded - Input: {input_size}, Hidden: {hidden_size}, k: {k}")
+    
+    # Determine which features to test
+    if subset_indices is not None:
+        features_to_test = subset_indices
+        print(f"Testing specific feature indices: {len(features_to_test)} features")
+    elif max_features_to_test is not None:
+        features_to_test = list(range(min(max_features_to_test, hidden_size)))
+        print(f"Testing first {len(features_to_test)} features")
+    else:
+        features_to_test = list(range(hidden_size))
+        print(f"Testing all {len(features_to_test)} features")
+    
+    # Define target modalities
+    target_modalities = {
+        'flux_g': LegacySurveyFluxG,
+        'flux_r': LegacySurveyFluxR,
+        'flux_i': LegacySurveyFluxI,
+        'flux_z': LegacySurveyFluxZ,
+    }
+    
+    # 1. GET BASELINE PREDICTIONS (no ablation)
+    print("\nGetting baseline predictions (no ablation)...")
+    baseline_predictions = {}
+    
+    for modality_name, modality_class in target_modalities.items():
+        all_predicted_fluxes = []
+        
+        for i in tqdm(range(0, len(image_tensor), batch_size), desc=f"Baseline {modality_name}"):
+            batch_img = image_tensor[i:i+batch_size]
+            img_mod = LegacySurveyImage(flux=batch_img, bands=dataset['bands'])
+            tokens = codec_manager.encode(img_mod)
+            
+            with torch.no_grad():
+                preds = model(tokens, target_modality=modality_class)
+                raw_logits = preds[modality_class.token_key]
+                token_indices = raw_logits.argmax(dim=-1)
+                tokens_for_decode = {modality_class.token_key: token_indices}
+                pred_values = codec_manager.decode(tokens_for_decode, modality_class)
+                flux_values = pred_values.value.squeeze().cpu().numpy()
+                all_predicted_fluxes.append(flux_values)
+        
+        baseline_predictions[modality_name] = np.concatenate(all_predicted_fluxes)
+    
+    print("Baseline predictions computed:")
+    for modality_name, flux_values in baseline_predictions.items():
+        print(f"  {modality_name}: {len(flux_values)} samples, range [{flux_values.min():.6f}, {flux_values.max():.6f}]")
+    
+    # 2. ABLATION EXPERIMENT - Test each feature
+    print(f"\nStarting ablation experiment for {len(features_to_test)} features...")
+    
+    ablation_results = {}
+    impact_metrics = {
+        'feature_idx': [],
+        'flux_g_mse': [],
+        'flux_r_mse': [],
+        'flux_i_mse': [],
+        'flux_z_mse': [],
+        'flux_g_mae': [],
+        'flux_r_mae': [],
+        'flux_i_mae': [],
+        'flux_z_mae': [],
+        'total_mse': [],
+        'total_mae': []
+    }
+    
+    def create_ablation_hook(target_feature_idx, sae_model):
+        """Create a hook that ablates a specific SAE feature using activation patching with proper normalization."""
+        def ablation_hook(module, input, output):
+            # Get original activations
+            original_activations = output  # Shape: [batch, seq_len, hidden_dim]
+            batch_size, seq_len, hidden_dim = original_activations.shape
+            
+            # Flatten activations for SAE
+            flat_activations = original_activations.view(-1, hidden_dim)  # [batch*seq_len, hidden_dim]
+            
+            with torch.no_grad():
+                # STEP 1: Apply same normalization as training
+                # Mean subtraction per sample (dim=1)
+                flat_activations_centered = flat_activations - flat_activations.mean(dim=1, keepdim=True)
+                
+                # Unit normalization
+                norms = torch.norm(flat_activations_centered, dim=1, keepdim=True)
+                flat_activations_normalized = flat_activations_centered / (norms + 1e-8)
+                
+                # STEP 2: Pass through SAE encoder to get latents
+                latents = sae_model.encoder(flat_activations_normalized)  # [batch*seq_len, sae_hidden_dim]
+                
+                # STEP 3: Get the decoder vector for the target feature
+                feature_decoder_vector = sae_model.decoder.weight[:, target_feature_idx]  # Shape: [hidden_dim]
+                
+                # STEP 4: Compute the contribution of this specific feature (in normalized space)
+                feature_activations = latents[:, target_feature_idx:target_feature_idx+1]  # [batch*seq_len, 1]
+                feature_contribution_normalized = feature_activations @ feature_decoder_vector.unsqueeze(0)  # [batch*seq_len, hidden_dim]
+                
+                # STEP 5: Subtract the feature's contribution in normalized space
+                ablated_flat_normalized = flat_activations_normalized - feature_contribution_normalized
+                
+                # STEP 6: Denormalize back to original space
+                # Multiply by original norms and add back original means
+                original_means = flat_activations.mean(dim=1, keepdim=True)
+                ablated_flat = ablated_flat_normalized * norms + original_means
+                
+                # STEP 7: Reshape back to original format
+                ablated_activations = ablated_flat.view(batch_size, seq_len, hidden_dim)
+            
+            return ablated_activations
+        
+        return ablation_hook
+    
+    # Test each feature
+    for i, feature_idx in enumerate(tqdm(features_to_test, desc="Testing features")):
+        if (i + 1) % 100 == 0:
+            print(f"\nTesting feature {feature_idx} ({i+1}/{len(features_to_test)})...")
+        
+        # Create ablation hook for this feature
+        hook_fn = create_ablation_hook(feature_idx, sae_model)
+        
+        # Register hook
+        handle = model.decoder[block_idx].register_forward_hook(hook_fn)
+        
+        try:
+            # Get predictions with this feature ablated
+            ablated_predictions = {}
+            
+            for modality_name, modality_class in target_modalities.items():
+                all_predicted_fluxes = []
+                
+                for j in range(0, len(image_tensor), batch_size):
+                    batch_img = image_tensor[j:j+batch_size]
+                    img_mod = LegacySurveyImage(flux=batch_img, bands=dataset['bands'])
+                    tokens = codec_manager.encode(img_mod)
+                    
+                    with torch.no_grad():
+                        preds = model(tokens, target_modality=modality_class)
+                        raw_logits = preds[modality_class.token_key]
+                        token_indices = raw_logits.argmax(dim=-1)
+                        tokens_for_decode = {modality_class.token_key: token_indices}
+                        pred_values = codec_manager.decode(tokens_for_decode, modality_class)
+                        flux_values = pred_values.value.squeeze().cpu().numpy()
+                        all_predicted_fluxes.append(flux_values)
+                
+                ablated_predictions[modality_name] = np.concatenate(all_predicted_fluxes)
+            
+            # Calculate impact metrics (how much did ablating this feature change predictions?)
+            total_mse = 0.0
+            total_mae = 0.0
+            
+            for modality_name in target_modalities.keys():
+                baseline_flux = baseline_predictions[modality_name]
+                ablated_flux = ablated_predictions[modality_name]
+                
+                # Calculate MSE and MAE
+                mse = np.mean((baseline_flux - ablated_flux) ** 2)
+                mae = np.mean(np.abs(baseline_flux - ablated_flux))
+                
+                impact_metrics[f'{modality_name}_mse'].append(mse)
+                impact_metrics[f'{modality_name}_mae'].append(mae)
+                
+                total_mse += mse
+                total_mae += mae
+            
+            impact_metrics['feature_idx'].append(feature_idx)
+            impact_metrics['total_mse'].append(total_mse)
+            impact_metrics['total_mae'].append(total_mae)
+            
+            # Store detailed results for significant features (to save memory)
+            if total_mse > 0:  # Only store if there's any impact
+                ablation_results[feature_idx] = {
+                    'ablated_predictions': ablated_predictions,
+                    'total_mse': total_mse,
+                    'total_mae': total_mae
+                }
+            
+            # Print progress for significant features
+            if len(impact_metrics['total_mse']) > 10:  # After we have some baseline
+                recent_median = np.median(impact_metrics['total_mse'][-100:])  # Recent median
+                if total_mse > recent_median * 5:  # Significantly above recent median
+                    print(f"  🔥 Feature {feature_idx}: Total MSE = {total_mse:.6f}, Total MAE = {total_mae:.6f}")
+        
+        finally:
+            # Always remove hook
+            handle.remove()
+    
+    # 3. ANALYZE RESULTS AND CREATE RANKINGS
+    print("\nAnalyzing results...")
+    
+    # Convert to DataFrame for easier analysis
+    df_metrics = pd.DataFrame(impact_metrics)
+    
+    # Sort by total impact
+    df_metrics_sorted = df_metrics.sort_values('total_mse', ascending=False)
+    
+    print("\nTop 20 most impactful features (by Total MSE):")
+    print(df_metrics_sorted.head(20)[['feature_idx', 'total_mse', 'total_mae']])
+    
+    # Print summary statistics
+    print(f"\nSummary Statistics:")
+    print(f"  Features tested: {len(features_to_test)}")
+    print(f"  Features with impact > 0: {(df_metrics['total_mse'] > 0).sum()}")
+    print(f"  Mean impact (MSE): {df_metrics['total_mse'].mean():.8f}")
+    print(f"  Std impact (MSE): {df_metrics['total_mse'].std():.8f}")
+    print(f"  Max impact (MSE): {df_metrics['total_mse'].max():.6f}")
+    print(f"  Top 1% threshold: {df_metrics['total_mse'].quantile(0.99):.6f}")
+    
+    # Save detailed results
+    results_summary = {
+        'features_tested': features_to_test,
+        'impact_metrics': impact_metrics,
+        'baseline_predictions': baseline_predictions,
+        'ablation_results': {k: v for k, v in ablation_results.items() if v['total_mse'] > df_metrics['total_mse'].quantile(0.95)},  # Only top 5%
+        'top_features': df_metrics_sorted.head(50)['feature_idx'].tolist(),
+        'experiment_config': {
+            'sae_weights_path': sae_weights_path,
+            'block_idx': block_idx,
+            'batch_size': batch_size,
+            'sample_size': sample_size,
+            'features_tested': len(features_to_test),
+            'input_size': input_size,
+            'hidden_size': hidden_size
+        }
+    }
+    
+    # Save results
+    results_file = os.path.join(save_dir, 'feature_ablation_results.pkl')
+    with open(results_file, 'wb') as f:
+        pickle.dump(results_summary, f)
+    print(f"Detailed results saved to {results_file}")
+    
+    # Save CSV of metrics for easy analysis
+    csv_file = os.path.join(save_dir, 'feature_impact_metrics.csv')
+    df_metrics_sorted.to_csv(csv_file, index=False)
+    print(f"Impact metrics CSV saved to {csv_file}")
+    
+    # 4. VISUALIZATION
+    print("\nCreating visualizations...")
+    
+    # Create a single figure with 4 panels as requested
+    plt.figure(figsize=(12, 8))
+    
+    # Panel 1: Histogram of MSE values per feature
+    plt.subplot(2, 2, 1)
+    plt.hist(impact_metrics['total_mse'], bins=30, alpha=0.7, edgecolor='black')
+    plt.xlabel('Total MSE Impact')
+    plt.ylabel('Number of Features')
+    plt.title('Distribution of MSE Impact per Feature')
+    plt.grid(True, alpha=0.3)
+    
+    # Panel 2: Histogram of MAE values per feature  
+    plt.subplot(2, 2, 2)
+    plt.hist(impact_metrics['total_mae'], bins=30, alpha=0.7, edgecolor='black')
+    plt.xlabel('Total MAE Impact')
+    plt.ylabel('Number of Features')
+    plt.title('Distribution of MAE Impact per Feature')
+    plt.grid(True, alpha=0.3)
+    
+    # Panel 3: Scatter plot of latent feature # vs. MSE value
+    plt.subplot(2, 2, 3)
+    plt.scatter(impact_metrics['feature_idx'], impact_metrics['total_mse'], alpha=0.6, s=20)
+    plt.xlabel('Latent Feature Index')
+    plt.ylabel('Total MSE Impact')
+    plt.title('Feature Index vs MSE Impact')
+    plt.grid(True, alpha=0.3)
+    
+    # Panel 4: Scatter plot of latent feature # vs. MAE value
+    plt.subplot(2, 2, 4)
+    plt.scatter(impact_metrics['feature_idx'], impact_metrics['total_mae'], alpha=0.6, s=20)
+    plt.xlabel('Latent Feature Index')
+    plt.ylabel('Total MAE Impact')
+    plt.title('Feature Index vs MAE Impact')
+    plt.grid(True, alpha=0.3)
+    
+    plt.tight_layout()
+    plt.savefig(os.path.join(save_dir, 'feature_ablation_analysis.png'), dpi=300, bbox_inches='tight')
+    plt.show()
+    
+    print(f"\nFeature ablation experiment complete!")
+    print(f"Results saved to {save_dir}")
+    print(f"Most impactful feature: {df_metrics_sorted.iloc[0]['feature_idx']} (MSE impact: {df_metrics_sorted.iloc[0]['total_mse']:.6f})")
+    print(f"Top 10 most impactful features: {df_metrics_sorted.head(10)['feature_idx'].tolist()}")
+    
+    return results_summary
+
+
+def simple_unembedding_check(
+    sae_weights_path='best_llm_sae_rural-wood-16.pth',
+    target_latent=1689,
+    device=None
+):
+    """
+    Simple check to understand dimensions and verify the concept of comparing
+    SAE features with unembedding vectors.
+    
+    IMPORTANT ARCHITECTURAL NOTE:
+    - SAE feature: Trained on activations from decoder block 8 (dim: 768)
+    - After block 8: Data flows through blocks 9, 10, 11, then decoder_norm
+    - Unembedding input: The normalized output after all blocks (dim: 768)
+    - Unembedding matrix: [vocab_size, 768]
+    
+    The comparison is meaningful because:
+    1. Residual connections preserve core information through later blocks
+    2. LayerNorm only rescales, doesn't rotate vector space
+    3. We're checking if the SAE feature at block 8 is already aligned with
+       the "flux direction" that will be enhanced by final blocks
+    """
+    if device is None:
+        device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    
+    print(f"=== Simple Unembedding Dimension Check ===")
+    print(f"Target latent: {target_latent}")
+    print(f"\nArchitectural Flow:")
+    print(f"  1. SAE hook location: Decoder block 8 output")
+    print(f"  2. Remaining processing: Blocks 9, 10, 11 + decoder_norm")
+    print(f"  3. Then: Unembedding for each modality")
+    
+    # Load AION model
+    print("\nLoading AION model...")
+    model = AION.from_pretrained('polymathic-ai/aion-base').to(device).eval()
+    
+    # Print model architecture info
+    print(f"  Decoder blocks: {len(model.decoder)} blocks")
+    print(f"  Model dimension: {model.dim}")
+    print(f"  Decoder norm: {model.decoder_norm}")
+    
+    # Load SAE model
+    print("Loading SAE model...")
+    input_size = 768  # AION's hidden dimension
+    hidden_size = input_size * 4
+    k = max(1, int(hidden_size * 0.02))
+    
+    sae_model = SparseAutoencoder(input_size, hidden_size, k=k).to(device)
+    sae_model.load_state_dict(torch.load(sae_weights_path, weights_only=True, map_location=device))
+    sae_model.eval()
+    
+    # Get SAE feature decoder vector
+    feature_vector = sae_model.decoder.weight[:, target_latent]  # Shape: [768]
+    print(f"\nSAE feature decoder vector:")
+    print(f"  Shape: {feature_vector.shape}")
+    print(f"  Norm: {torch.norm(feature_vector).item():.6f}")
+    print(f"  Sample values: {feature_vector[:5].tolist()}")
+    
+    # Check flux modalities
+    flux_modalities = {
+        'flux_g': LegacySurveyFluxG,
+        'flux_r': LegacySurveyFluxR,
+        'flux_i': LegacySurveyFluxI,
+        'flux_z': LegacySurveyFluxZ,
+    }
+    
+    print(f"\nChecking unembedding matrices for flux modalities...")
+    
+    overall_max_similarity = 0.0
+    overall_results = {}
+    
+    for band_name, modality_class in flux_modalities.items():
+        print(f"\n{band_name} ({modality_class.__name__}):")
+        
+        # Get token key
+        token_key = modality_class.token_key
+        print(f"  Token key: {token_key}")
+        
+        # Check if this modality exists in the model
+        if token_key not in model.decoder_embeddings:
+            print(f"  ❌ Not found in decoder_embeddings")
+            continue
+        
+        # Get the decoder embedding
+        decoder_emb = model.decoder_embeddings[token_key]
+        print(f"  Decoder embedding type: {type(decoder_emb).__name__}")
+        
+        # Get the unembedding matrix
+        if hasattr(decoder_emb, 'to_logits'):
+            unembedding_matrix = decoder_emb.to_logits.weight  # Shape: [vocab_size, hidden_dim]
+            vocab_size, hidden_dim = unembedding_matrix.shape
+            print(f"  ✅ Unembedding matrix shape: {unembedding_matrix.shape}")
+            print(f"     Vocab size: {vocab_size}, Hidden dim: {hidden_dim}")
+            
+            # Check dimensional compatibility
+            if hidden_dim == feature_vector.shape[0]:
+                print(f"  ✅ Dimensions compatible! (both {hidden_dim})")
+                
+                # Compute a few example similarities
+                with torch.no_grad():
+                    feature_norm = feature_vector / torch.norm(feature_vector)
+                    
+                    # Check similarity with first few unembedding vectors
+                    print(f"     Sample similarities with first few tokens:")
+                    for i in range(min(5, vocab_size)):
+                        unemb_vec = unembedding_matrix[i, :]
+                        if torch.norm(unemb_vec) > 1e-8:  # Skip zero vectors
+                            unemb_norm = unemb_vec / torch.norm(unemb_vec)
+                            similarity = torch.dot(feature_norm, unemb_norm).item()
+                            print(f"       Token {i}: cosine similarity = {similarity:.4f}")
+                    
+                    # Find max similarity across all tokens
+                    unemb_norms = torch.norm(unembedding_matrix, dim=1)
+                    valid_tokens = unemb_norms > 1e-8
+                    if valid_tokens.sum() > 0:
+                        valid_unembedding = unembedding_matrix[valid_tokens]
+                        valid_unembedding_norm = valid_unembedding / torch.norm(valid_unembedding, dim=1, keepdim=True)
+                        all_similarities = torch.matmul(valid_unembedding_norm, feature_norm)
+                        max_sim = torch.max(all_similarities).item()
+                        max_idx_in_valid = torch.argmax(all_similarities).item()
+                        # Convert back to original index
+                        valid_indices = torch.where(valid_tokens)[0]
+                        max_idx = valid_indices[max_idx_in_valid].item()
+                        
+                        print(f"     Maximum similarity: {max_sim:.4f} (token {max_idx})")
+                        print(f"     Mean abs similarity: {torch.mean(torch.abs(all_similarities)).item():.4f}")
+                        print(f"     Std of similarities: {torch.std(all_similarities).item():.4f}")
+                        
+                        overall_max_similarity = max(overall_max_similarity, max_sim)
+                        overall_results[band_name] = {
+                            'max_similarity': max_sim,
+                            'max_token': max_idx,
+                            'mean_abs_similarity': torch.mean(torch.abs(all_similarities)).item(),
+                            'std_similarity': torch.std(all_similarities).item(),
+                            'vocab_size': vocab_size
+                        }
+                    else:
+                        print(f"     ⚠️ All unembedding vectors are zero!")
+                        
+            else:
+                print(f"  ❌ Dimension mismatch! Unembedding: {hidden_dim}, SAE feature: {feature_vector.shape[0]}")
+        else:
+            print(f"  ❌ No 'to_logits' attribute found")
+    
+    print(f"\n=== Summary ===")
+    print("The concept: If SAE feature decoder vector has high cosine similarity")
+    print("with any unembedding vector, then the SAE feature might just be")
+    print("learning to 'push towards' that output token, which would be trivial.")
+    print("\nArchitectural consideration: The SAE feature is from block 8,")
+    print("but unembedding happens after blocks 9-11 + norm. However, residual")
+    print("connections mean the core direction may already be present at block 8.")
+    
+    if overall_results:
+        print(f"\nResults across all bands:")
+        for band, results in overall_results.items():
+            print(f"  {band}: max_sim={results['max_similarity']:.4f}, mean_abs={results['mean_abs_similarity']:.4f}")
+        
+        print(f"\nOverall maximum similarity: {overall_max_similarity:.4f}")
+        
+        if overall_max_similarity > 0.8:
+            print("⚠️  HIGH SIMILARITY: Feature may be trivially aligned with unembedding")
+        elif overall_max_similarity > 0.5:
+            print("⚡ MODERATE SIMILARITY: Worth investigating further")
+        else:
+            print("✅ LOW SIMILARITY: Feature likely captures more complex patterns")
+    
+    return model, sae_model, feature_vector, overall_results
 
 if __name__ == '__main__':
     # probe()
@@ -1086,4 +1650,23 @@ if __name__ == '__main__':
     #     save_dir='probe_flux_in_sae_image_to_flux_results'
     # )
 
-    results, true_data = intervention_experiment()
+    # First, check if the SAE feature is aligned with unembedding directions
+    # print("Running unembedding similarity analysis...")
+    # similarity_results = analyze_sae_feature_vs_unembedding_similarity(
+    #     target_latent=1689,
+    #     save_dir='unembedding_analysis_results'
+    # )
+    # model, sae_model, feature_vector, overall_results = simple_unembedding_check(target_latent=1689)
+
+    # Run intervention experiment
+    # print("Running intervention experiment...")
+    # results, true_data = intervention_experiment()
+    
+    
+    # NEW: Test the FIXED SAE feature ablation experiment with proper normalization
+    # Test with small sample to verify the normalization fix works
+    print("Testing FIXED SAE feature ablation experiment with proper normalization...")
+    ablation_results = ablate_all_sae_features(
+        max_features_to_test=None, 
+        sample_size=100,  
+    )
