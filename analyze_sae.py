@@ -25,12 +25,7 @@ from aion import AION
 from sklearn.manifold import TSNE
 from sklearn.decomposition import PCA
 from sklearn.preprocessing import StandardScaler
-from visualization import collect_activations_with_raw_data_mapping, top_k_inputs_for_sae_latent_neuron_n
-
-# from top_activations import (
-#     collect_activations_and_their_inputs_tokens_and_modalities,
-#     top_k_activating_tokens_and_modalities_for_latent_neuron_n,
-# )
+from detailed_analysis import collect_activations, top_k_raw_tokens_for_sae_latent_neuron_n
 
 # Get the current script's directory
 current_dir = os.path.dirname(os.path.abspath(__file__))
@@ -64,6 +59,87 @@ class Args:
         self.out_domains = None
         self.all_domains = None
 
+
+class NewtonRaphsonLogisticRegression:
+    """1D logistic regression using Newton-Raphson optimization"""
+    def __init__(self, max_iter=100, tol=1e-8):
+        self.max_iter = max_iter
+        self.tol = tol
+        self.w = None
+        self.b = None
+    
+    def _sigmoid(self, z):
+        """Sigmoid activation function"""
+        return 1 / (1 + np.exp(-np.clip(z, -30, 30)))  # Clip to avoid overflow
+    
+    def _loss(self, params, X, y):
+        """Binary cross-entropy loss"""
+        w, b = params
+        z = w * X + b
+        y_pred = self._sigmoid(z)
+        # Avoid log(0) errors
+        epsilon = 1e-15
+        y_pred = np.clip(y_pred, epsilon, 1 - epsilon)
+        return -np.mean(y * np.log(y_pred) + (1 - y) * np.log(1 - y_pred))
+    
+    def _gradient(self, params, X, y):
+        """Gradient of loss with respect to parameters"""
+        w, b = params
+        z = w * X + b
+        y_pred = self._sigmoid(z)
+        error = y_pred - y
+        grad_w = np.mean(error * X)
+        grad_b = np.mean(error)
+        return np.array([grad_w, grad_b])
+    
+    def _hessian(self, params, X, y):
+        """Hessian matrix (second derivatives)"""
+        w, b = params
+        z = w * X + b
+        y_pred = self._sigmoid(z)
+        diag = y_pred * (1 - y_pred)
+        H_ww = np.mean(diag * X * X)
+        H_wb = np.mean(diag * X)
+        H_bb = np.mean(diag)
+        return np.array([[H_ww, H_wb], [H_wb, H_bb]])
+    
+    def fit(self, X, y):
+        """Fit the model using Newton-Raphson method"""
+        # Initialize parameters
+        params = np.zeros(2)  # [w, b]
+        
+        for _ in range(self.max_iter):
+            # Calculate gradient and Hessian
+            gradient = self._gradient(params, X, y)
+            hessian = self._hessian(params, X, y)
+            
+            # Newton update: params = params - H^(-1) * gradient
+            try:
+                update = np.linalg.solve(hessian, gradient)
+            except np.linalg.LinAlgError:
+                # If Hessian is singular, add small value to diagonal
+                hessian = hessian + np.eye(2) * 1e-6
+                update = np.linalg.solve(hessian, gradient)
+            
+            # Update parameters
+            params = params - update
+            
+            # Check convergence
+            if np.linalg.norm(update) < self.tol:
+                break
+        
+        self.w, self.b = params
+        return self
+    
+    def predict_proba(self, X):
+        """Predict probability of class 1"""
+        z = self.w * X + self.b
+        return self._sigmoid(z)
+    
+    def predict(self, X, threshold=0.5):
+        """Predict class labels"""
+        return (self.predict_proba(X) >= threshold).astype(int)
+        
 def count_examples_in_shard(shard_path):
     """Count the number of examples in a WebDataset shard."""
     print(f"\nCounting examples in shard: {shard_path}")
@@ -1910,31 +1986,18 @@ if __name__ == '__main__':
     #     random_state=42
     # )
 
-    # topk_df = top_k_inputs_for_sae_latent_neuron_n(
-    #     autoencoder,
-    #     latent_neuron_n=0,
-    #     k=10,
-    #     activations_tensor_flat=activations_tensor_flat,
-    #     modality_labels_flat=modality_labels_flat,
-    #     model=model
-    # )
+    activations_flat, modality_labels_flat, raw_values_flat = collect_activations(
+        model, data_loader_train, device, args
+    )   
 
-    activations_flat, modality_labels_flat, sample_mapping, decoder_tokens_cache, original_batch_cache = collect_activations_with_raw_data_mapping(
-        model, data_loader_train, device, args)
-
-    # Run the top-k attribution using the exact decoder tokens for detokenization.
-    df = top_k_inputs_for_sae_latent_neuron_n(
+    df = top_k_raw_tokens_for_sae_latent_neuron_n(
         sae=autoencoder,
         activations_tensor_flat=activations_flat,
         modality_labels_flat=modality_labels_flat,
+        raw_values_flat=raw_values_flat,
         latent_neuron_n=0,
+        model=model,
         k=10,
         batch_size=8192,
-        sample_mapping=sample_mapping,
-        decoder_tokens_cache=decoder_tokens_cache,
-        original_batch_cache=original_batch_cache,
-        model=model,
         save_dir="latent_topk_visualizations",
-        filename_prefix="",
-        create_plots=True,
     )
